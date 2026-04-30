@@ -946,7 +946,13 @@ public final class CoreMLLLM: @unchecked Sendable {
         }
 
         return AsyncStream { continuation in
-            Task(priority: decodePriority) {
+            // T4 cancellation: AsyncStream does NOT auto-cancel the producer
+            // task when the consumer breaks out of `for await`. Bind a
+            // handle so onTermination can call cancel(). Combined with
+            // Task.checkCancellation() at chunk and decode-step boundaries,
+            // a user-initiated cancel (or stream deinit) stops generation
+            // promptly instead of running to maxDecode.
+            let genTask = Task(priority: decodePriority) {
                 do {
                     let IMAGE_TOKEN_ID = 258880
                     let AUDIO_TOKEN_ID = 258881
@@ -1020,6 +1026,7 @@ public final class CoreMLLLM: @unchecked Sendable {
                             engine.currentPosition = prefillLen
 
                             for step in prefillLen..<tokens.count {
+                                try Task.checkCancellation()
                                 let tid = tokens[step]
                                 try autoreleasepool {
                                     if let emb = multimodalEmbedding(for: tid) {
@@ -1033,6 +1040,7 @@ public final class CoreMLLLM: @unchecked Sendable {
                             }
                         } else {
                             for (step, tid) in tokens.enumerated() {
+                                try Task.checkCancellation()
                                 try autoreleasepool {
                                     if let emb = multimodalEmbedding(for: tid) {
                                         nextID = try engine.predictStep(tokenID: 0, position: step,
@@ -1097,6 +1105,10 @@ public final class CoreMLLLM: @unchecked Sendable {
                         decodeLoop: while tokenCount < maxDecode {
                             if eosIDs.contains(Int(nid)) { break }
                             if engine.currentPosition >= ctxLimit { break }
+                            // T4: stop the loop the moment the consumer
+                            // unsubscribes — wired via continuation.onTermination
+                            // → genTask.cancel() below.
+                            try Task.checkCancellation()
 
                             let useEagle = (eagleSpec != nil) && didFirstDecode
                                 && engine.canSpeculate
@@ -1277,10 +1289,15 @@ public final class CoreMLLLM: @unchecked Sendable {
                             pos += 1
                         }
                     }
+                } catch is CancellationError {
+                    // T4: user-cancelled. No log spam — this is expected.
                 } catch {
                     print("[CoreMLLLM] Error: \(error)")
                 }
                 continuation.finish()
+            }
+            continuation.onTermination = { @Sendable _ in
+                genTask.cancel()
             }
         }
     }
