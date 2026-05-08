@@ -282,7 +282,9 @@ final class ChunkedEngine {
     // MARK: - Loading
 
     static func load(from directory: URL, config: ModelConfig,
-                     computeUnits: MLComputeUnits) async throws -> ChunkedEngine {
+                     computeUnits: MLComputeUnits,
+                     onProgress: (@Sendable (String) -> Void)? = nil)
+                     async throws -> ChunkedEngine {
         // iOS 18+ MLOptimizationHints.specializationStrategy = .fastPrediction
         // trades a longer first-load ANE specialization for (nominally)
         // shorter per-prediction wall time.
@@ -515,6 +517,27 @@ final class ChunkedEngine {
             }
         }
 
+        // Per-chunk progress emits. Decode and prefill have separate "K/N"
+        // counters so the launch UI can show "Loading decode chunk 2/4…" then
+        // "Loading prefill chunk 1/4…". The emit fires when a chunk is seeded
+        // into the TaskGroup — which in the default sequential case (cap=1)
+        // is right before MLModel(contentsOf:) starts.
+        let progressDecodeSlots = is3Chunk ? 3 : 4
+        let progressPrefillSlots = chunkWork.filter {
+            $0.0.hasPrefix("prefill_")
+        }.count
+        var decodeSeeded = 0
+        var prefillSeeded = 0
+        func emitSeedProgress(_ name: String) {
+            if name.hasPrefix("prefill_") {
+                prefillSeeded += 1
+                onProgress?("Loading prefill chunk \(prefillSeeded)/\(progressPrefillSlots)…")
+            } else {
+                decodeSeeded += 1
+                onProgress?("Loading decode chunk \(decodeSeeded)/\(progressDecodeSlots)…")
+            }
+        }
+
         let loadT0 = CFAbsoluteTimeGetCurrent()
         try await withThrowingTaskGroup(of: (String, MLModel).self) { group in
             let cap = loadMaxParallel > 0
@@ -524,6 +547,7 @@ final class ChunkedEngine {
             // Seed the initial wave of up to `cap` compilations.
             while idx < cap {
                 let (name, cfg) = chunkWork[idx]
+                emitSeedProgress(name)
                 group.addTask { (name, try loadOne(name, config: cfg)) }
                 idx += 1
             }
@@ -544,6 +568,7 @@ final class ChunkedEngine {
                 }
                 if idx < chunkWork.count {
                     let (nextName, nextCfg) = chunkWork[idx]
+                    emitSeedProgress(nextName)
                     group.addTask {
                         (nextName, try loadOne(nextName, config: nextCfg))
                     }
@@ -551,6 +576,7 @@ final class ChunkedEngine {
                 }
             }
         }
+        onProgress?("Decode chunks ready")
         let loadDt = CFAbsoluteTimeGetCurrent() - loadT0
         let loadMode: String
         switch loadMaxParallel {
@@ -855,8 +881,21 @@ final class ChunkedEngine {
         if deferPrefill && hasPrefillFiles {
             let directoryCopy = directory
             let prefillConfigCopy = prefillConfig
+            // Captured by the detached task so prefill load progress reaches
+            // the same caller-supplied callback that drove the foreground
+            // emits. The task outlives `load(...)` (deferred-prefill) so the
+            // closure must remain invokable after this call returns.
+            let progressCopy = onProgress
             let task = Task.detached(priority: .utility) { [weak engine] () throws -> Void in
                 let bgT0 = CFAbsoluteTimeGetCurrent()
+                progressCopy?("Loading prefill chunks…")
+                // Counter actor so concurrent bgLoad completions emit a
+                // monotonic "K/4 ready" sequence regardless of finish order.
+                actor PrefillCounter {
+                    var done = 0
+                    func bump() -> Int { done += 1; return done }
+                }
+                let counter = PrefillCounter()
                 func bgFind(_ name: String) -> URL? {
                     let c = directoryCopy.appendingPathComponent("\(name).mlmodelc")
                     if FileManager.default.fileExists(atPath:
@@ -865,13 +904,15 @@ final class ChunkedEngine {
                     if FileManager.default.fileExists(atPath: p.path) { return p }
                     return nil
                 }
-                func bgLoad(_ name: String) throws -> MLModel {
+                func bgLoad(_ name: String) async throws -> MLModel {
                     guard let url = bgFind(name) else {
                         throw CoreMLLLMError.modelNotFound(name)
                     }
                     let t0 = CFAbsoluteTimeGetCurrent()
                     let m = try MLModel(contentsOf: url, configuration: prefillConfigCopy)
                     print("[Load/bg] \(name) done in \(String(format: "%.1f", CFAbsoluteTimeGetCurrent() - t0))s")
+                    let k = await counter.bump()
+                    progressCopy?("Prefill chunks \(k)/4 ready")
                     return m
                 }
                 // Load the four prefill chunks concurrently so the
@@ -889,6 +930,7 @@ final class ChunkedEngine {
                 let bgDt = CFAbsoluteTimeGetCurrent() - bgT0
                 print("[Load/bg] all 4 prefill chunks ready in \(String(format: "%.1f", bgDt))s — warming")
                 try? engine.warmPrefillOnly()
+                progressCopy?("Ready")
             }
             engine.setPrefillLoadTask(task)
         }

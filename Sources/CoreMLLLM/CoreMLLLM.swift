@@ -190,7 +190,7 @@ public final class CoreMLLLM: @unchecked Sendable {
     public static func load(
         from directory: URL,
         computeUnits: MLComputeUnits = .cpuAndNeuralEngine,
-        onProgress: ((String) -> Void)? = nil
+        onProgress: (@Sendable (String) -> Void)? = nil
     ) async throws -> CoreMLLLM {
         onProgress?("Reading config...")
         let config = try ModelConfig.load(from: directory)
@@ -237,9 +237,13 @@ public final class CoreMLLLM: @unchecked Sendable {
                 atPath: directory.appendingPathComponent("chunk1.mlpackage").path)
 
         if isChunked {
-            onProgress?("Loading chunks (first run = ANE compile, can take 1-2 min)...")
+            // Per-chunk progress strings ("Loading decode chunk K/N…",
+            // "Loading prefill chunk K/4…") are emitted from inside
+            // ChunkedEngine.load and forwarded to the caller. The single
+            // "Loading chunks…" placeholder is no longer needed.
             llm.chunkedEngine = try await ChunkedEngine.load(
-                from: directory, config: config, computeUnits: computeUnits)
+                from: directory, config: config, computeUnits: computeUnits,
+                onProgress: onProgress)
             // MLComputePlan silent-fallback audit (§G2) — runs only when
             // COMPUTE_PLAN_AUDIT env var or UserDefaults key is set.
             await ComputePlanAudit.run(modelDirectory: directory,
@@ -684,7 +688,7 @@ public final class CoreMLLLM: @unchecked Sendable {
     public static func load(
         model: ModelDownloader.ModelInfo,
         computeUnits: MLComputeUnits = .cpuAndNeuralEngine,
-        onProgress: ((String) -> Void)? = nil
+        onProgress: (@Sendable (String) -> Void)? = nil
     ) async throws -> CoreMLLLM {
         let downloader = ModelDownloader.shared
         let modelURL: URL
@@ -697,6 +701,16 @@ public final class CoreMLLLM: @unchecked Sendable {
         let directory = modelURL.deletingLastPathComponent()
         return try await load(from: directory, computeUnits: computeUnits,
                                onProgress: onProgress)
+    }
+
+    /// Block until the deferred-prefill background load (if any) finishes.
+    /// CoreMLLLM.load returns as soon as decode chunks are ready; prefill
+    /// chunks load in the background. Callers showing a launch progress UI
+    /// can await this so the bar reaches 100% only after prefill is fully
+    /// loaded. No-op for non-chunked models or when prefill files were
+    /// absent / loaded synchronously.
+    public func awaitPrefillReady() async throws {
+        try await chunkedEngine?.prefillLoadTask?.value
     }
 
     /// Whether EAGLE-3 speculative decoding is loaded and active for this model.

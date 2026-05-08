@@ -99,6 +99,40 @@ Multimodal encoders are lazy-loaded (~1 GB). The "Download Options → Include m
 
 `URLSessionConfiguration.background` with 4 concurrent connections. `finishDownload` hardlinks shared decode↔prefill weights (e.g. `chunk1↔prefill_chunk1`) instead of copying to save ~682 MB on disk.
 
+## Examples
+
+### CoreMLLLMChat (`Examples/CoreMLLLMChat/`)
+The primary demo app. Supports all model variants (Gemma 4, Qwen3-VL, Qwen3.5), multimodal input (image/video/audio), speculative decoding toggles, and benchmark views.
+
+```bash
+open Examples/CoreMLLLMChat/CoreMLLLMChat.xcodeproj
+```
+
+### VoiceAssistant (`~/Desktop/VoiceAssistant/`)
+A production-template iOS voice assistant built on top of this library. Pipeline: STT (SFSpeechRecognizer, on-device) → Gemma 4 (CoreMLLLM) → TTS (AVSpeechSynthesizer, sentence-streaming). No extra dependencies; fully offline.
+
+```
+~/Desktop/VoiceAssistant/
+├── VoiceAssistant.xcodeproj
+├── VoiceAssistantApp.swift          — @main + AppDelegate for background URLSession
+├── Services/
+│   ├── LLMService.swift             — CoreMLLLM wrapper (@Observable)
+│   ├── SpeechTranscriber.swift      — SFSpeechRecognizer + AVAudioEngine (push-to-talk)
+│   └── SpeechSynthesizer.swift      — AVSpeechSynthesizer with sentence-boundary flushing
+├── ViewModels/
+│   └── VoiceAssistantViewModel.swift — state machine: idle → listening → thinking → speaking
+├── Views/
+│   ├── ContentView.swift            — chat UI + mic hold-to-talk button
+│   ├── MessageBubble.swift
+│   └── ModelLoadView.swift          — first-launch download + progress
+├── Models/
+│   └── ConversationMessage.swift
+└── VoiceAssistant/
+    └── Assets.xcassets              — app icon + accent color
+```
+
+CoreML-LLM is linked as a local SPM package. Requires iPhone 15 Pro / 16 (≥6 GB RAM) for Gemma 4 E2B.
+
 ## Key docs
 
 | Topic | File |
