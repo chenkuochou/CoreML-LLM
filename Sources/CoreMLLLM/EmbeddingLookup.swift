@@ -44,7 +44,10 @@ final class EmbeddingLookup {
                 // Vectorized: int8 → float32 → scale → float16
                 vDSP.convertElements(of: UnsafeBufferPointer(start: int8Ptr, count: dim),
                                      to: &f32Buffer)
-                vDSP.multiply(rowScale, f32Buffer, result: &f32Buffer)
+                f32Buffer.withUnsafeMutableBufferPointer { p in
+                    var s = rowScale
+                    vDSP_vsmul(p.baseAddress!, 1, &s, p.baseAddress!, 1, vDSP_Length(dim))
+                }
                 f32Buffer.withUnsafeBufferPointer { src in
                     var srcBuf = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: src.baseAddress!),
                                                height: 1, width: UInt(dim), rowBytes: dim * 4)
@@ -70,7 +73,10 @@ final class EmbeddingLookup {
                 let rowScale = fp16ToF32(scalePtr[tokenID]) / 127.0
                 vDSP.convertElements(of: UnsafeBufferPointer(start: int8Ptr, count: dim),
                                      to: &f32Buffer)
-                vDSP.multiply(rowScale, f32Buffer, result: &f32Buffer)
+                f32Buffer.withUnsafeMutableBufferPointer { p in
+                    var s = rowScale
+                    vDSP_vsmul(p.baseAddress!, 1, &s, p.baseAddress!, 1, vDSP_Length(dim))
+                }
                 f32Buffer.withUnsafeBufferPointer { src in
                     var srcBuf = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: src.baseAddress!),
                                                height: 1, width: UInt(dim), rowBytes: dim * 4)
@@ -93,7 +99,10 @@ final class EmbeddingLookup {
                 let rowScale = fp16ToF32(scalePtr[tokenID]) / 127.0 * scale
                 vDSP.convertElements(of: UnsafeBufferPointer(start: int8Ptr, count: dim),
                                      to: &f32Buffer)
-                vDSP.multiply(rowScale, f32Buffer, result: &f32Buffer)
+                f32Buffer.withUnsafeMutableBufferPointer { p in
+                    var s = rowScale
+                    vDSP_vsmul(p.baseAddress!, 1, &s, p.baseAddress!, 1, vDSP_Length(dim))
+                }
                 f32Buffer.withUnsafeBufferPointer { src in
                     var srcBuf = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: src.baseAddress!),
                                                height: 1, width: UInt(dim), rowBytes: dim * 4)
