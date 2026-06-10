@@ -49,6 +49,16 @@ public final class ModelDownloader: NSObject {
     private var activeTaskFileIndex: [Int: Int] = [:]
     private var activeTaskBytes: [Int: Int64] = [:]
 
+    // Failed-file retry state. A task that dies with a transient error
+    // (network handoff, system cancelling a background task) must put its
+    // file back in the queue — `nextFileIndex` has already walked past it,
+    // so dropping it would let the download "finish" without the file and
+    // the model fail at load time with a missing-file error.
+    private var retryFileIndices: [Int] = []
+    private var fileRetryCounts: [Int: Int] = [:]  // pendingFiles index → attempts
+    private var completionSweepsDone = 0
+    private let maxRetriesPerFile = 3
+
     // A background URLSession can carry over tasks from a prior process.
     // We adopt those (or cancel orphans) once on init via getAllTasks; until
     // adoption completes we defer download/resume so we don't spawn fresh
@@ -478,6 +488,19 @@ public final class ModelDownloader: NSObject {
         }
         let chunk1 = dir.appendingPathComponent("chunk1.mlmodelc")
         if fileManager.fileExists(atPath: chunk1.appendingPathComponent("weights/weight.bin").path) {
+            // chunk1 (a big, download-first weight) is present, but that alone
+            // does NOT mean the bundle is loadable. The tiny core sidecars —
+            // `model_config.json` above all — download last, so an install
+            // interrupted between the weights and the small-file batch leaves
+            // chunk1 on disk without the config `load(from:)` needs. Reporting
+            // such a folder as "present" makes the caller skip the resumable
+            // repair download and loop forever on "model_config.json not
+            // found". Treat a missing config as not-downloaded so the next
+            // download() rebuilds the file list and re-fetches only the gap.
+            guard fileManager.fileExists(
+                atPath: dir.appendingPathComponent("model_config.json").path) else {
+                return nil
+            }
             if isChunkCtxMismatched(modelDir: dir, chunk1Dir: chunk1) {
                 try? fileManager.removeItem(at: dir)
                 return nil
@@ -549,6 +572,7 @@ public final class ModelDownloader: NSObject {
                     self.isPaused = false
                     self.progress = 0
                     self.status = "Starting..."
+                    self.resetRetryState()
 
                     let dest = self.modelsDirectory.appendingPathComponent(model.folderName)
                     self.destDir = dest
@@ -601,6 +625,7 @@ public final class ModelDownloader: NSObject {
             // on disk and skips files an adopted task is already fetching.
             self.nextFileIndex = 0
             self.completedBytes = 0
+            self.resetRetryState()
             self.fillDownloadSlots()
         }
     }
@@ -614,6 +639,7 @@ public final class ModelDownloader: NSObject {
         activeTaskBytes.removeAll()
         nextFileIndex = 0
         completedBytes = 0
+        resetRetryState()
         isDownloading = false
         isPaused = false
         progress = 0
@@ -689,6 +715,15 @@ public final class ModelDownloader: NSObject {
 
     /// Start downloads until we have `maxConcurrentDownloads` active tasks,
     /// or all files are dispatched. Skips files that already exist on disk.
+    /// Clears failed-file retry bookkeeping. Call wherever the download
+    /// queue itself is (re)built or torn down — stale indices from a prior
+    /// `pendingFiles` array would point at the wrong files.
+    private func resetRetryState() {
+        retryFileIndices = []
+        fileRetryCounts = [:]
+        completionSweepsDone = 0
+    }
+
     private func fillDownloadSlots() {
         guard !isPaused else {
             saveState()
@@ -700,9 +735,17 @@ public final class ModelDownloader: NSObject {
         // hand the same file to a second task and double-count its bytes.
         var activeIndices = Set(activeTaskFileIndex.values)
 
-        while activeDownloadTasks.count < maxConcurrentDownloads && nextFileIndex < pendingFiles.count {
-            let idx = nextFileIndex
-            nextFileIndex += 1
+        while activeDownloadTasks.count < maxConcurrentDownloads {
+            // Re-queued failures take priority over the sequential walk.
+            let idx: Int
+            if !retryFileIndices.isEmpty {
+                idx = retryFileIndices.removeFirst()
+            } else if nextFileIndex < pendingFiles.count {
+                idx = nextFileIndex
+                nextFileIndex += 1
+            } else {
+                break
+            }
 
             if activeIndices.contains(idx) { continue }
 
@@ -745,7 +788,8 @@ public final class ModelDownloader: NSObject {
         }
 
         // All files dispatched and all tasks completed → finish
-        if activeDownloadTasks.isEmpty && nextFileIndex >= pendingFiles.count {
+        if activeDownloadTasks.isEmpty && nextFileIndex >= pendingFiles.count
+            && retryFileIndices.isEmpty {
             finishDownload()
             return
         }
@@ -780,6 +824,7 @@ public final class ModelDownloader: NSObject {
         activeTaskBytes.removeAll()
         pendingFiles = []
         nextFileIndex = 0
+        resetRetryState()
         isDownloading = false
         isPaused = false
         downloadingModelId = nil
@@ -798,6 +843,41 @@ public final class ModelDownloader: NSObject {
 
     private func finishDownload() {
         guard let model = currentModel, let dest = destDir else { return }
+
+        // Completeness sweep: never resume success with files missing.
+        // Catches anything that slipped past the per-task retry (e.g. a
+        // failed temp-file move in didFinishDownloadingTo). Missing files
+        // get re-queued for up to two extra passes; after that, throw so
+        // the app's error → retry(repair:) path takes over instead of the
+        // model failing at load time with a confusing missing-file error.
+        let missing = pendingFiles.indices.filter { idx in
+            let f = pendingFiles[idx]
+            if f.localPath == "__archive.zip" { return false }  // deleted after extraction
+            if isOptionalMlmodelcFile(f.localPath) { return false }  // legitimately 404s
+            return !fileManager.fileExists(atPath: dest.appendingPathComponent(f.localPath).path)
+        }
+        if !missing.isEmpty {
+            if completionSweepsDone < 2 {
+                completionSweepsDone += 1
+                print("[Download] Completeness sweep \(completionSweepsDone): re-fetching \(missing.count) missing file(s)")
+                retryFileIndices.append(contentsOf: missing)
+                fillDownloadSlots()
+                return
+            }
+            let names = missing.prefix(3).map { pendingFiles[$0].localPath }.joined(separator: ", ")
+            status = "Error: download incomplete"
+            isDownloading = false
+            isPaused = false
+            downloadingModelId = nil
+            cleanupPersistedState()
+            let err = NSError(domain: "CoreMLLLM.ModelDownloader", code: -3, userInfo: [
+                NSLocalizedDescriptionKey:
+                    "Download incomplete: \(missing.count) file(s) couldn't be fetched (\(names)). Please try again.",
+            ])
+            downloadContinuation?.resume(throwing: err)
+            downloadContinuation = nil
+            return
+        }
 
         // Share decode weights with prefill chunks ONLY if prefill metadata
         // (coremldata.bin) was downloaded for that chunk. Models that don't
@@ -904,6 +984,7 @@ public final class ModelDownloader: NSObject {
         totalBytesForAllFiles = state.totalBytes
         nextFileIndex = 0
         completedBytes = 0
+        resetRetryState()
         downloadingModelId = model.id
         isDownloading = true
         isPaused = true
@@ -1618,17 +1699,38 @@ extension ModelDownloader: URLSessionDownloadDelegate {
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            let fileIndex = self.activeTaskFileIndex[taskId]
             self.activeDownloadTasks.removeValue(forKey: taskId)
             self.activeTaskFileIndex.removeValue(forKey: taskId)
             self.activeTaskBytes.removeValue(forKey: taskId)
 
-            // If other tasks are still active, just log and continue
-            if !self.activeDownloadTasks.isEmpty || self.nextFileIndex < self.pendingFiles.count {
+            // Re-queue the failed file (bounded). Without this the file is
+            // lost — nextFileIndex already advanced past it — and the
+            // download "succeeds" minus one file, which the model only
+            // notices at load time ("…couldn't be opened because there is
+            // no such file"). Background sessions hit transient task
+            // failures routinely, so this is the common path, not the edge.
+            if let idx = fileIndex, idx < self.pendingFiles.count {
+                let attempts = (self.fileRetryCounts[idx] ?? 0) + 1
+                self.fileRetryCounts[idx] = attempts
+                if attempts <= self.maxRetriesPerFile {
+                    print("[Download] Retry \(attempts)/\(self.maxRetriesPerFile) for \(self.pendingFiles[idx].localPath): \(error.localizedDescription)")
+                    self.retryFileIndices.append(idx)
+                    self.fillDownloadSlots()
+                    return
+                }
+            }
+
+            // Retries exhausted for this file. If other work remains, keep
+            // going — the completeness sweep in finishDownload will surface
+            // the gap; otherwise fail the download with the real error.
+            if !self.activeDownloadTasks.isEmpty
+                || self.nextFileIndex < self.pendingFiles.count
+                || !self.retryFileIndices.isEmpty {
                 self.fillDownloadSlots()
                 return
             }
 
-            // All tasks failed
             self.status = "Error: \(error.localizedDescription)"
             self.isDownloading = false
             self.isPaused = false

@@ -97,7 +97,7 @@ Multimodal encoders are lazy-loaded (~1 GB). The "Download Options → Include m
 
 ### Download (`ModelDownloader.swift`)
 
-`URLSessionConfiguration.background` with 4 concurrent connections. `finishDownload` hardlinks shared decode↔prefill weights (e.g. `chunk1↔prefill_chunk1`) instead of copying to save ~682 MB on disk.
+`URLSessionConfiguration.background` with 4 concurrent connections. `finishDownload` hardlinks shared decode↔prefill weights (e.g. `chunk1↔prefill_chunk1`) instead of copying to save ~682 MB on disk. A task that fails with a transient error is re-queued (3 attempts per file) and `finishDownload` runs a completeness sweep before resuming success — background sessions drop tasks routinely, and a silently missing file otherwise only surfaces at model load (“…couldn’t be opened because there is no such file”).
 
 ## Examples
 
