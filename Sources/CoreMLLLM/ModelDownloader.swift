@@ -41,7 +41,9 @@ public final class ModelDownloader: NSObject {
     public var backgroundCompletionHandler: (() -> Void)?
     private static let sessionIdentifier = "com.coreml-llm.model-download"
 
-    // Parallel download state
+    // Parallel download state. All pending files are enqueued with the
+    // session at once (see fillDownloadSlots); this constant only caps
+    // simultaneous connections via httpMaximumConnectionsPerHost.
     private let maxConcurrentDownloads = 4
     private var nextFileIndex = 0
     private var completedBytes: Int64 = 0
@@ -300,6 +302,14 @@ public final class ModelDownloader: NSObject {
         let modelId: String
         let totalBytes: Int64
         let files: [DownloadFile]
+        // Optional so states persisted before these fields still decode.
+        // Apps can download a ModelInfo that isn't in `availableModels` (or
+        // shadows an entry's id with a different mirror URL — Evie does);
+        // resolving the restored id against `availableModels` would silently
+        // re-point gap re-fetches at the wrong host.
+        var downloadURL: String?
+        var folderName: String?
+        var modelName: String?
     }
 
     // MARK: - Init
@@ -501,6 +511,22 @@ public final class ModelDownloader: NSObject {
                 atPath: dir.appendingPathComponent("model_config.json").path) else {
                 return nil
             }
+            // Prefill weights aren't downloaded — finishDownload hardlinks
+            // them from the decode chunks as a post-processing step. A kill
+            // between the last file landing and that step leaves prefill
+            // metadata (coremldata.bin) without weights, which CoreML rejects
+            // at load time ("Could not open …/prefill_chunkN/weights/
+            // weight.bin"). Report such a bundle as not-downloaded so the
+            // caller re-runs download(), which skips every existing file and
+            // just finishes the link step. Prefill-less layouts (e.g. E4B)
+            // have no prefill dirs and fall through untouched.
+            for i in 1...4 {
+                let prefill = dir.appendingPathComponent("prefill_chunk\(i).mlmodelc")
+                if fileManager.fileExists(atPath: prefill.appendingPathComponent("coremldata.bin").path)
+                    && !fileManager.fileExists(atPath: prefill.appendingPathComponent("weights/weight.bin").path) {
+                    return nil
+                }
+            }
             if isChunkCtxMismatched(modelDir: dir, chunk1Dir: chunk1) {
                 try? fileManager.removeItem(at: dir)
                 return nil
@@ -553,10 +579,17 @@ public final class ModelDownloader: NSObject {
             DispatchQueue.main.async { [weak self] in
                 self?.runAfterAdoption {
                     guard let self else { return }
-                    // Resume paused download for same model
-                    if self.isPaused && self.currentModel?.id == model.id {
+                    // Same model already in flight (paused-restored after a
+                    // relaunch, or unparked and still running) — attach to it
+                    // instead of cancel-restarting, which would throw away the
+                    // daemon's in-flight transfers. A second concurrent caller
+                    // would orphan the first await; cancel it rather than leak.
+                    if self.isDownloading && self.currentModel?.id == model.id {
+                        self.downloadContinuation?.resume(throwing: CancellationError())
                         self.downloadContinuation = continuation
-                        self.resumeDownload()
+                        if self.isPaused {
+                            self.resumeDownload()
+                        }
                         return
                     }
 
@@ -713,8 +746,8 @@ public final class ModelDownloader: NSObject {
 
     // MARK: - Parallel Download Scheduling
 
-    /// Start downloads until we have `maxConcurrentDownloads` active tasks,
-    /// or all files are dispatched. Skips files that already exist on disk.
+    /// Dispatch every not-yet-active file to the background session.
+    /// Skips files that already exist on disk.
     /// Clears failed-file retry bookkeeping. Call wherever the download
     /// queue itself is (re)built or torn down — stale indices from a prior
     /// `pendingFiles` array would point at the wrong files.
@@ -735,7 +768,15 @@ public final class ModelDownloader: NSObject {
         // hand the same file to a second task and double-count its bytes.
         var activeIndices = Set(activeTaskFileIndex.values)
 
-        while activeDownloadTasks.count < maxConcurrentDownloads {
+        // Hand EVERY remaining file to the background session up front.
+        // nsurlsessiond runs them while the app is suspended (concurrency is
+        // still bounded by httpMaximumConnectionsPerHost). The old cap of
+        // `maxConcurrentDownloads` in-flight tasks meant each refill needed an
+        // in-process call — i.e. an app wake per batch of 4 when backgrounded.
+        // iOS rate-limits background-session wakes, so a ~50-file bundle
+        // crawled for hours in the background and the download-complete
+        // notification never fired.
+        while true {
             // Re-queued failures take priority over the sequential walk.
             let idx: Int
             if !retryFileIndices.isEmpty {
@@ -795,6 +836,21 @@ public final class ModelDownloader: NSObject {
         }
 
         saveState()
+    }
+
+    /// Downloads restored after a process kill are parked paused (no caller
+    /// owns a continuation yet — see `restorePendingDownload`). Session events
+    /// arriving means nsurlsessiond already ran the transfers, e.g. the system
+    /// relaunched a terminated app in the background to deliver them. Un-park
+    /// so `fillDownloadSlots` keeps dispatching and `finishDownload` (sweep +
+    /// prefill hardlinks) runs inside that background wake — otherwise the
+    /// bundle stays one post-processing step short of complete and the app's
+    /// download-finished notification is suppressed. A user-initiated `pause()`
+    /// keeps its continuation alive and cancels its tasks, so it never matches.
+    private func unparkRestoredDownloadIfNeeded() {
+        if isPaused && downloadContinuation == nil {
+            isPaused = false
+        }
     }
 
     private func updateProgress() {
@@ -959,7 +1015,10 @@ public final class ModelDownloader: NSObject {
         let state = PersistedState(
             modelId: model.id,
             totalBytes: totalBytesForAllFiles,
-            files: pendingFiles
+            files: pendingFiles,
+            downloadURL: model.downloadURL,
+            folderName: model.folderName,
+            modelName: model.name
         )
         try? JSONEncoder().encode(state).write(to: stateURL)
     }
@@ -970,8 +1029,16 @@ public final class ModelDownloader: NSObject {
 
     private func restorePendingDownload() {
         guard let data = try? Data(contentsOf: stateURL),
-              let state = try? JSONDecoder().decode(PersistedState.self, from: data),
-              let model = availableModels.first(where: { $0.id == state.modelId }) else { return }
+              let state = try? JSONDecoder().decode(PersistedState.self, from: data) else { return }
+        let model: ModelInfo
+        if let url = state.downloadURL, let folder = state.folderName {
+            model = ModelInfo(id: state.modelId, name: state.modelName ?? state.modelId,
+                              size: "", downloadURL: url, folderName: folder)
+        } else if let known = availableModels.first(where: { $0.id == state.modelId }) {
+            model = known
+        } else {
+            return
+        }
 
         if localModelURL(for: model) != nil {
             cleanupPersistedState()
@@ -1609,6 +1676,7 @@ extension ModelDownloader: URLSessionDownloadDelegate {
                 print("[Download] Skipping optional missing file: \(localPath) (404)")
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
+                    self.unparkRestoredDownloadIfNeeded()
                     self.activeDownloadTasks.removeValue(forKey: taskId)
                     self.activeTaskFileIndex.removeValue(forKey: taskId)
                     self.activeTaskBytes.removeValue(forKey: taskId)
@@ -1653,6 +1721,7 @@ extension ModelDownloader: URLSessionDownloadDelegate {
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            self.unparkRestoredDownloadIfNeeded()
             self.activeDownloadTasks.removeValue(forKey: taskId)
             self.activeTaskFileIndex.removeValue(forKey: taskId)
             self.activeTaskBytes.removeValue(forKey: taskId)
@@ -1699,6 +1768,7 @@ extension ModelDownloader: URLSessionDownloadDelegate {
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            self.unparkRestoredDownloadIfNeeded()
             let fileIndex = self.activeTaskFileIndex[taskId]
             self.activeDownloadTasks.removeValue(forKey: taskId)
             self.activeTaskFileIndex.removeValue(forKey: taskId)
