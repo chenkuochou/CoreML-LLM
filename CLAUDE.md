@@ -130,7 +130,7 @@ open Examples/CoreMLLLMChat/CoreMLLLMChat.xcodeproj
 ```
 
 ### Evie (`~/Desktop/Evie/`)
-The production consumer — a shipping App Store iOS voice assistant for children: STT (`SFSpeechRecognizer`, on-device) → Gemma 4 E2B via this package → Kokoro TTS (FluidAudio). Linked as a local SPM package by absolute path; requires ≥6 GB RAM devices. Its `CLAUDE.md` documents the app-side contracts this package must not break: the stop-sequence discipline around `reset()` (never reset mid-generation), the 2048-ctx prompt token budget, the mirror-pinned `ModelInfo.evieGemma` (id `gemma4-e2b-3way`), and the load-progress strings its `LLMService.fractionFor` parses. (An older `~/Desktop/VoiceAssistant/` template this section used to describe no longer exists.)
+The production consumer — a shipping App Store iOS voice assistant for children: STT (`SFSpeechRecognizer`, on-device) → Gemma 4 E2B via this package → Kokoro TTS (FluidAudio). Linked as a local SPM package by absolute path; requires ≥6 GB RAM devices. Its `CLAUDE.md` documents the app-side contracts this package must not break: the stop-sequence discipline around `reset()` (never reset mid-generation), the 2048-ctx prompt token budget, the mirror-pinned `ModelInfo.evieGemma` (id `gemma4-e2b-3way-split` — 3way layout + the split per-layer embed parts hosted only on Evie's mirror), and the load-progress strings its `LLMService.fractionFor` parses. (An older `~/Desktop/VoiceAssistant/` template this section used to describe no longer exists.)
 
 ## Key docs
 
