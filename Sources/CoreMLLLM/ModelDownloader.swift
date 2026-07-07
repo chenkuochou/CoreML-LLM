@@ -312,6 +312,28 @@ public final class ModelDownloader: NSObject {
         var modelName: String?
     }
 
+    // MARK: - Split embed (gemma4-e2b-3way-split)
+
+    /// A lone 2.35 GB `embed_tokens_per_layer_q8.bin` pins the download tail
+    /// to a single connection at the CDN's per-stream cap (~30 MB/s observed
+    /// vs ~50 MB/s for 4 parallel streams on a ~500 Mbps link). The
+    /// `gemma4-e2b-3way-split` id downloads it as 4 equal 587,202,560-byte
+    /// parts (byte-identical slices, hosted alongside the whole file on
+    /// mirrors that opt in) and `finishDownload` re-joins them. Non-split ids
+    /// are untouched — they keep fetching the single file.
+    private static let splitEmbedJoinedName = "embed_tokens_per_layer_q8.bin"
+    private static let splitEmbedPartCount = 4
+    private static let splitEmbedPartSize: Int64 = 587_202_560
+
+    nonisolated private static func isSplitEmbedPart(_ localPath: String) -> Bool {
+        localPath.hasPrefix(splitEmbedJoinedName + ".part")
+    }
+
+    /// Guards against a second `finishDownload` (e.g. a re-attached caller
+    /// triggering `resumeDownload`) dispatching a concurrent join over the
+    /// same temp file while one is already in flight.
+    private var isJoiningSplitEmbed = false
+
     // MARK: - Init
 
     override init() {
@@ -804,6 +826,16 @@ public final class ModelDownloader: NSObject {
                 }
             }
 
+            // Split-embed part whose joined output already exists (repair
+            // sweep over a completed install): the join consumed the parts,
+            // so their absence is expected — satisfied, no network.
+            if Self.isSplitEmbedPart(file.localPath),
+               fileManager.fileExists(atPath: dest.appendingPathComponent(Self.splitEmbedJoinedName).path) {
+                completedBytes += file.estimatedSize
+                updateProgress()
+                continue
+            }
+
             // Build URL
             let urlString: String
             if file.remotePath.hasPrefix("http") {
@@ -910,6 +942,11 @@ public final class ModelDownloader: NSObject {
             let f = pendingFiles[idx]
             if f.localPath == "__archive.zip" { return false }  // deleted after extraction
             if isOptionalMlmodelcFile(f.localPath) { return false }  // legitimately 404s
+            // A consumed split-embed part is satisfied by its joined output.
+            if Self.isSplitEmbedPart(f.localPath),
+               fileManager.fileExists(atPath: dest.appendingPathComponent(Self.splitEmbedJoinedName).path) {
+                return false
+            }
             return !fileManager.fileExists(atPath: dest.appendingPathComponent(f.localPath).path)
         }
         if !missing.isEmpty {
@@ -934,6 +971,57 @@ public final class ModelDownloader: NSObject {
             downloadContinuation = nil
             return
         }
+
+        // Split-embed join: multi-GB sequential file I/O, so hop off the
+        // main queue (same pattern as the zip-extraction path) and re-enter
+        // the completion tail on main when done. `isJoiningSplitEmbed`
+        // guards a second finishDownload (e.g. a re-attached caller's
+        // resumeDownload) from racing a concurrent join over the same temp.
+        let joinedURL = dest.appendingPathComponent(Self.splitEmbedJoinedName)
+        let firstPartURL = dest.appendingPathComponent("\(Self.splitEmbedJoinedName).part1")
+        if !fileManager.fileExists(atPath: joinedURL.path),
+           fileManager.fileExists(atPath: firstPartURL.path) {
+            guard !isJoiningSplitEmbed else { return }
+            isJoiningSplitEmbed = true
+            status = "Assembling..."
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let joinError = Self.joinSplitEmbedParts(in: dest)
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.isJoiningSplitEmbed = false
+                    if let joinError {
+                        self.status = "Error: couldn't assemble model files"
+                        self.isDownloading = false
+                        self.isPaused = false
+                        self.downloadingModelId = nil
+                        self.cleanupPersistedState()
+                        self.downloadContinuation?.resume(throwing: joinError)
+                        self.downloadContinuation = nil
+                    } else {
+                        self.completeDownload(model: model, dest: dest)
+                    }
+                }
+            }
+            return
+        }
+        // Stray parts next to an existing joined file (crash between the
+        // join's rename and its part cleanup): finish the cleanup here.
+        if fileManager.fileExists(atPath: joinedURL.path) {
+            for i in 1...Self.splitEmbedPartCount {
+                let part = dest.appendingPathComponent("\(Self.splitEmbedJoinedName).part\(i)")
+                if fileManager.fileExists(atPath: part.path) {
+                    try? fileManager.removeItem(at: part)
+                }
+            }
+        }
+
+        completeDownload(model: model, dest: dest)
+    }
+
+    /// Everything after the completeness sweep + split-embed join: prefill
+    /// weight sharing, stray-directory cleanup, and resuming the caller.
+    /// Runs on the main queue.
+    private func completeDownload(model: ModelInfo, dest: URL) {
 
         // Share decode weights with prefill chunks ONLY if prefill metadata
         // (coremldata.bin) was downloaded for that chunk. Models that don't
@@ -1001,6 +1089,61 @@ public final class ModelDownloader: NSObject {
             downloadContinuation?.resume(throwing: DownloadError.extractionFailed)
         }
         downloadContinuation = nil
+    }
+
+    /// Re-join the split-embed parts into `embed_tokens_per_layer_q8.bin`.
+    /// Crash-safe: appends into a `.joining` temp (each part deleted right
+    /// after it's consumed, capping transient disk at ~one part), renamed to
+    /// the final name only after every part is in. A crash mid-join leaves a
+    /// stale temp plus missing consumed parts — the caller's completeness
+    /// sweep re-fetches exactly those parts on the next repair pass and the
+    /// join restarts from scratch. Pure file I/O; runs off the main queue.
+    nonisolated private static func joinSplitEmbedParts(in dest: URL) -> Error? {
+        let fm = FileManager.default
+        let joined = dest.appendingPathComponent(splitEmbedJoinedName)
+        let parts = (1...splitEmbedPartCount).map {
+            dest.appendingPathComponent("\(splitEmbedJoinedName).part\($0)")
+        }
+        guard parts.allSatisfy({ fm.fileExists(atPath: $0.path) }) else {
+            // Caller only dispatches with part1 present after the sweep
+            // passed, so this is defensive.
+            return NSError(domain: "CoreMLLLM.ModelDownloader", code: -4, userInfo: [
+                NSLocalizedDescriptionKey: "Model file parts are incomplete. Please retry the download.",
+            ])
+        }
+        let temp = dest.appendingPathComponent(splitEmbedJoinedName + ".joining")
+        try? fm.removeItem(at: temp)  // stale temp from a crashed join
+        do {
+            fm.createFile(atPath: temp.path, contents: nil)
+            let out = try FileHandle(forWritingTo: temp)
+            defer { try? out.close() }
+            for part in parts {
+                let input = try FileHandle(forReadingFrom: part)
+                defer { try? input.close() }
+                while true {
+                    // Bounded reads keep peak memory at one buffer; the
+                    // autoreleasepool drops the bridged NSData each pass.
+                    let chunk = try autoreleasepool {
+                        try input.read(upToCount: 16 * 1024 * 1024)
+                    }
+                    guard let chunk, !chunk.isEmpty else { break }
+                    try out.write(contentsOf: chunk)
+                }
+                try? input.close()
+                try fm.removeItem(at: part)
+            }
+            try out.close()
+            try fm.moveItem(at: temp, to: joined)
+            print("[Download] Joined \(parts.count) split-embed parts → \(splitEmbedJoinedName)")
+            return nil
+        } catch {
+            try? fm.removeItem(at: temp)
+            return NSError(domain: "CoreMLLLM.ModelDownloader", code: -4, userInfo: [
+                NSLocalizedDescriptionKey:
+                    "Couldn't assemble \(splitEmbedJoinedName) from its parts: "
+                    + "\(error.localizedDescription). Free up storage and retry.",
+            ])
+        }
     }
 
     // MARK: - Persistence
@@ -1140,7 +1283,11 @@ public final class ModelDownloader: NSObject {
         // for a -45 MB bundle delta. The legacy gemma4e2b entry still
         // pulls chunk2/3/4 for backward-compat with apps that haven't
         // upgraded to the 3-chunk loader path.
-        let is3Way = (model.id == "gemma4-e2b-3way")
+        // The -split variant is the 3way layout with the per-layer embed
+        // fetched as 4 parts (see the split-embed constants above). Only
+        // mirrors that host the part files can serve it — Evie's does.
+        let is3Way = (model.id == "gemma4-e2b-3way" || model.id == "gemma4-e2b-3way-split")
+        let splitEmbed = (model.id == "gemma4-e2b-3way-split")
         var chunkFiles = mlc("swa", "chunk1", "chunk1", weightSize: 155_436_864)
         if is3Way {
             chunkFiles += mlc("swa", "chunk2_3way", "chunk2_3way",
@@ -1182,7 +1329,6 @@ public final class ModelDownloader: NSObject {
             .init(remotePath: "hf_model/config.json", localPath: "hf_model/config.json", estimatedSize: 5_000),
             .init(remotePath: "embed_tokens_q8.bin", localPath: "embed_tokens_q8.bin", estimatedSize: 402_653_184),
             .init(remotePath: "embed_tokens_scales.bin", localPath: "embed_tokens_scales.bin", estimatedSize: 524_288),
-            .init(remotePath: "embed_tokens_per_layer_q8.bin", localPath: "embed_tokens_per_layer_q8.bin", estimatedSize: 2_348_810_240),
             .init(remotePath: "embed_tokens_per_layer_scales.bin", localPath: "embed_tokens_per_layer_scales.bin", estimatedSize: 524_288),
             .init(remotePath: "per_layer_projection.bin", localPath: "per_layer_projection.bin", estimatedSize: 27_525_120),
             .init(remotePath: "per_layer_norm_weight.bin", localPath: "per_layer_norm_weight.bin", estimatedSize: 1_024),
@@ -1224,12 +1370,30 @@ public final class ModelDownloader: NSObject {
             .init(remotePath: "embed_proj_weight.npy", localPath: "embed_proj_weight.npy", estimatedSize: 4_718_720),
         ]
 
+        // 2.35 GB per-layer embeddings — the biggest single file in the
+        // bundle. Split ids fetch it as 4 parts so it doesn't pin the
+        // download tail to one connection; finishDownload re-joins them.
+        let perLayerEmbedFiles: [DownloadFile]
+        if splitEmbed {
+            perLayerEmbedFiles = (1...Self.splitEmbedPartCount).map {
+                .init(remotePath: "\(Self.splitEmbedJoinedName).part\($0)",
+                      localPath: "\(Self.splitEmbedJoinedName).part\($0)",
+                      estimatedSize: Self.splitEmbedPartSize)
+            }
+        } else {
+            perLayerEmbedFiles = [
+                .init(remotePath: Self.splitEmbedJoinedName,
+                      localPath: Self.splitEmbedJoinedName,
+                      estimatedSize: 2_348_810_240)
+            ]
+        }
+
         // Default: include multimodal (full bundle). User opts out via
         // ModelPickerView's "Include multimodal" toggle (UserDefaults).
         // Stored value = false means text-only install; default unset = true.
         let includeMM = UserDefaults.standard
             .object(forKey: ModelDownloader.includeMultimodalKey) as? Bool ?? true
-        let extraFiles = coreFiles + (includeMM ? multimodalFiles : [])
+        let extraFiles = coreFiles + perLayerEmbedFiles + (includeMM ? multimodalFiles : [])
         if !includeMM {
             print("[Download] gemma4-e2b: multimodal opt-out — encoders skipped (saves ~990 MB)")
         }
