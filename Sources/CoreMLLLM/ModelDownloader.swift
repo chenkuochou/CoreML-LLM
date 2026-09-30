@@ -32,6 +32,9 @@ public final class ModelDownloader: NSObject {
     private let fileManager = FileManager.default
     /// One background session per lane — see `laneCount`.
     private var sessions: [URLSession] = []
+    /// In-process sessions used while the app is in the foreground — see
+    /// `foregroundSessionCount`.
+    private var foregroundSessions: [URLSession] = []
     private var currentModel: ModelInfo?
     private var destDir: URL?
     private var pendingFiles: [DownloadFile] = []
@@ -59,19 +62,51 @@ public final class ModelDownloader: NSObject {
         lane == 0 ? sessionIdentifier : "\(sessionIdentifier).lane\(lane)"
     }
 
-    /// `taskIdentifier` is only unique within one session.
+    /// Foreground-first, hand off once (iOS). Background sessions run in
+    /// nsurlsessiond, and on device that costs a lot: a slow start of 75 s
+    /// to 3 min before they reach speed (varies run to run; HF measured fast
+    /// from a Mac at the same moment), and they're starved to ~0.07 MB/s
+    /// while the app has its own foreground traffic. In-process sessions
+    /// reached ~30 MB/s within 5 s. So while the app is in the foreground,
+    /// files go to `foregroundSessions` a few at a time (refilled as each
+    /// lands — no tail of idle lanes); on backgrounding, everything left
+    /// moves to the background lanes for good (`handOffToBackgroundLanes`).
+    private static let foregroundSessionCount = 8
+    private static let foregroundTasksPerSession = 2
+    #if os(iOS)
+    /// Set while this download is parked on the background lanes (app in
+    /// the background); cleared when `reclaimUnstartedLaneTasks` pulls
+    /// work back to the foreground sessions.
+    private var handedOffToBackground = false
+    #endif
+
+    /// `taskIdentifier` is only unique within one session. Foreground
+    /// sessions have no identifier, so they're named by `sessionDescription`.
     private struct TaskKey: Hashable {
         let session: String
         let id: Int
+        var isForeground: Bool { session.hasPrefix("fg") }
     }
     nonisolated private static func key(_ session: URLSession, _ task: URLSessionTask) -> TaskKey {
-        TaskKey(session: session.configuration.identifier ?? "", id: task.taskIdentifier)
+        TaskKey(session: session.sessionDescription ?? session.configuration.identifier ?? "",
+                id: task.taskIdentifier)
     }
 
     // Parallel download state. All pending files are enqueued with the
     // sessions at once (see fillDownloadSlots).
     private var nextFileIndex = 0
     private var completedBytes: Int64 = 0
+    /// Bytes each file contributes to `completedBytes`, by `pendingFiles`
+    /// index. Counting goes through `count(_:bytes:)` so a file can never be
+    /// counted twice: a relaunch mid-download once summed the on-disk
+    /// segments at restore and again in the first dispatch walk (~3 GB
+    /// counted twice) and tripped the 1.5× oversize abort.
+    private var countedBytes: [Int: Int64] = [:]
+    /// Highest byte count shown so far. Moving tasks between session kinds
+    /// drops their partial bytes, and a restore re-walks from zero; the
+    /// published progress holds still until the real count catches up
+    /// instead of running backwards.
+    private var shownBytesHighWater: Int64 = 0
     private var activeDownloadTasks: [TaskKey: URLSessionDownloadTask] = [:]
     private var activeTaskFileIndex: [TaskKey: Int] = [:]
     private var activeTaskBytes: [TaskKey: Int64] = [:]
@@ -92,6 +127,7 @@ public final class ModelDownloader: NSObject {
     // tasks that would race with — and double-download — the survivors.
     private var tasksAdopted = false
     private var lanesAwaitingAdoption = 0
+    private var fillDeferredToAdoption = false
 
     // Console timing breadcrumbs (`logProgressIfDue`).
     private var progressLogStart: Date?
@@ -419,6 +455,23 @@ public final class ModelDownloader: NSObject {
             config.httpMaximumConnectionsPerHost = 2
             return URLSession(configuration: config, delegate: self, delegateQueue: nil)
         }
+        foregroundSessions = (0..<Self.foregroundSessionCount).map { i in
+            let config = URLSessionConfiguration.ephemeral
+            config.urlCache = nil
+            config.requestCachePolicy = .reloadIgnoringLocalCacheData
+            config.timeoutIntervalForResource = 7200
+            let session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+            session.sessionDescription = "fg\(i)"
+            return session
+        }
+        #if os(iOS)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(appDidEnterBackground),
+            name: UIApplication.didEnterBackgroundNotification, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(appDidBecomeActive),
+            name: UIApplication.didBecomeActiveNotification, object: nil)
+        #endif
         lanesAwaitingAdoption = sessions.count
         for session in sessions {
             session.getAllTasks { [weak self] tasks in
@@ -460,6 +513,19 @@ public final class ModelDownloader: NSObject {
         lanesAwaitingAdoption -= 1
         guard lanesAwaitingAdoption == 0 else { return }
         tasksAdopted = true
+        #if os(iOS)
+        // A relaunch mid-download: survivors sit on the lanes. In the
+        // background, keep new work there too; in the foreground, reclaim
+        // the unstarted ones (an `.inactive` launch gets it from
+        // `appDidBecomeActive`).
+        if !activeDownloadTasks.isEmpty {
+            switch UIApplication.shared.applicationState {
+            case .background: handedOffToBackground = true
+            case .active: scheduleReclaim()
+            default: break
+            }
+        }
+        #endif
         let actions = pendingAdoptionActions
         pendingAdoptionActions.removeAll()
         for a in actions { a() }
@@ -698,6 +764,7 @@ public final class ModelDownloader: NSObject {
                     if self.isDownloading && self.currentModel?.id == model.id {
                         self.downloadContinuation?.resume(throwing: CancellationError())
                         self.downloadContinuation = continuation
+                        if self.progressLogStart == nil { self.progressLogStart = Date() }
                         if self.isPaused {
                             self.resumeDownload()
                         }
@@ -716,9 +783,13 @@ public final class ModelDownloader: NSObject {
                     self.isPaused = false
                     self.progress = 0
                     self.status = "Starting..."
+                    self.shownBytesHighWater = 0
                     self.progressLogStart = Date()
                     self.lastProgressLog = nil
                     self.loggedFirstBytes = false
+                    #if os(iOS)
+                    self.handedOffToBackground = false
+                    #endif
                     self.resetRetryState()
 
                     let dest = self.modelsDirectory.appendingPathComponent(model.folderName)
@@ -738,6 +809,7 @@ public final class ModelDownloader: NSObject {
                         )]
                         self.totalBytesForAllFiles = 350_000_000
                         self.completedBytes = 0
+                        self.countedBytes = [:]
                         self.nextFileIndex = 0
                         self.fillDownloadSlots()
                     }
@@ -772,12 +844,14 @@ public final class ModelDownloader: NSObject {
             // on disk and skips files an adopted task is already fetching.
             self.nextFileIndex = 0
             self.completedBytes = 0
+            self.countedBytes = [:]
             self.resetRetryState()
             self.fillDownloadSlots()
         }
     }
 
     public func cancelDownload() {
+        shownBytesHighWater = 0
         for task in activeDownloadTasks.values {
             task.cancel()
         }
@@ -786,6 +860,7 @@ public final class ModelDownloader: NSObject {
         activeTaskBytes.removeAll()
         nextFileIndex = 0
         completedBytes = 0
+        countedBytes = [:]
         resetRetryState()
         isDownloading = false
         isPaused = false
@@ -876,21 +951,39 @@ public final class ModelDownloader: NSObject {
             saveState()
             return
         }
+        // Before a relaunch's adoption lands, every surviving background
+        // task looks absent and would be dispatched a second time.
+        guard tasksAdopted else {
+            if !fillDeferredToAdoption {
+                fillDeferredToAdoption = true
+                pendingAdoptionActions.append { [weak self] in
+                    self?.fillDeferredToAdoption = false
+                    self?.fillDownloadSlots()
+                }
+            }
+            return
+        }
 
         // Files currently being fetched by an adopted or in-flight task.
         // Without this guard, restarting the loop after a pause/relaunch could
         // hand the same file to a second task and double-count its bytes.
         var activeIndices = Set(activeTaskFileIndex.values)
 
-        // Hand EVERY remaining file to the background sessions up front.
-        // nsurlsessiond runs them while the app is suspended (each lane's
-        // tasks share that lane's connection). The old cap of 4 in-flight
-        // tasks meant each refill needed an in-process call — i.e. an app
-        // wake per batch of 4 when backgrounded.
-        // iOS rate-limits background-session wakes, so a ~50-file bundle
+        // Foreground: a bounded few per in-process session, refilled from
+        // the delegate as each lands. Background: hand EVERY remaining file
+        // to the background lanes up front — nsurlsessiond runs them while
+        // the app is suspended, whereas a bounded queue would need an app
+        // wake per refill, and iOS rate-limits those (a ~50-file bundle once
         // crawled for hours in the background and the download-complete
-        // notification never fired.
+        // notification never fired).
+        let foreground = usesForegroundSessions
+        var foregroundLoad = [Int](repeating: 0, count: foregroundSessions.count)
+        for key in activeDownloadTasks.keys where key.isForeground {
+            if let i = Int(key.session.dropFirst(2)), i < foregroundLoad.count { foregroundLoad[i] += 1 }
+        }
+        let foregroundCapacity = foregroundSessions.count * Self.foregroundTasksPerSession
         while true {
+            if foreground && foregroundLoad.reduce(0, +) >= foregroundCapacity { break }
             // Re-queued failures take priority over the sequential walk.
             let idx: Int
             if !retryFileIndices.isEmpty {
@@ -912,7 +1005,7 @@ public final class ModelDownloader: NSObject {
             if file.localPath != "__archive.zip" && fileManager.fileExists(atPath: destFile.path) {
                 let existingSize = (try? fileManager.attributesOfItem(atPath: destFile.path))?[.size] as? Int64 ?? 0
                 if existingSize > 0 {
-                    completedBytes += existingSize
+                    count(idx, bytes: existingSize)
                     updateProgress()
                     continue
                 }
@@ -923,7 +1016,7 @@ public final class ModelDownloader: NSObject {
             // expected — satisfied, no network.
             if let target = Self.joinTarget(of: file),
                fileManager.fileExists(atPath: dest.appendingPathComponent(target).path) {
-                completedBytes += file.estimatedSize
+                count(idx, bytes: file.estimatedSize)
                 updateProgress()
                 continue
             }
@@ -950,9 +1043,16 @@ public final class ModelDownloader: NSObject {
                 // Offsets index the raw file, never a compressed body.
                 request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
             }
-            // Consecutive indices (a file's segments) land on different
-            // lanes, i.e. different connections.
-            let lane = sessions[idx % sessions.count]
+            // Foreground: the least-loaded session. Background: consecutive
+            // indices (a file's segments) land on different lanes, i.e.
+            // different connections.
+            let lane: URLSession
+            if foreground, let i = foregroundLoad.indices.min(by: { foregroundLoad[$0] < foregroundLoad[$1] }) {
+                lane = foregroundSessions[i]
+                foregroundLoad[i] += 1
+            } else {
+                lane = sessions[idx % sessions.count]
+            }
             let task = lane.downloadTask(with: request)
             task.taskDescription = file.localPath
             task.resume()
@@ -987,6 +1087,69 @@ public final class ModelDownloader: NSObject {
             isPaused = false
         }
     }
+
+    /// Dispatch to in-process sessions? `.inactive` counts as foreground: a
+    /// cold launch starts the install before the app turns `.active`.
+    private var usesForegroundSessions: Bool {
+        #if os(iOS)
+        return !handedOffToBackground && UIApplication.shared.applicationState != .background
+        #else
+        return false
+        #endif
+    }
+
+    #if os(iOS)
+    /// Backgrounding mid-download: in-process sessions stall once the app is
+    /// backgrounded (device: 16 foreground segments moved ~34 MB in 20 s), so
+    /// cancel them right away and queue them — with everything not yet
+    /// started — on the background lanes, which nsurlsessiond keeps running.
+    @objc private func appDidEnterBackground() {
+        guard isDownloading, !isPaused, tasksAdopted, !handedOffToBackground else { return }
+        handedOffToBackground = true
+        let moved = requeue { $0.isForeground }
+        fillDownloadSlots()
+        print("[Download] backgrounded — \(moved) foreground segments and all queued files moved to background lanes")
+    }
+
+    @objc private func appDidBecomeActive() {
+        guard isDownloading, activeDownloadTasks.keys.contains(where: { !$0.isForeground }) else { return }
+        scheduleReclaim()
+    }
+
+    /// Back in the foreground: pull every lane task back to the foreground
+    /// sessions, started or not. Lanes start slowly, and ones that did start
+    /// while backgrounded then crawled (device: 22 of them at ~2.4 MB/s total
+    /// for 7+ min with the app open) — re-fetching their partial segments in
+    /// the foreground (~40 MB/s) is far cheaper. Waits a moment so a quick
+    /// app switch doesn't churn.
+    private func scheduleReclaim() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self, self.isDownloading, !self.isPaused, self.tasksAdopted,
+                  UIApplication.shared.applicationState == .active else { return }
+            self.handedOffToBackground = false
+            let moved = self.requeue { !$0.isForeground }
+            self.fillDownloadSlots()
+            if moved > 0 {
+                print("[Download] foreground — \(moved) lane tasks moved to foreground sessions")
+            }
+        }
+    }
+
+    /// Cancel matching active tasks and put their files at the front of the
+    /// queue (not counted as retry attempts). Returns how many moved.
+    private func requeue(where match: (TaskKey) -> Bool) -> Int {
+        let keys = activeDownloadTasks.keys.filter(match)
+        for key in keys {
+            activeDownloadTasks[key]?.cancel()
+            if let idx = activeTaskFileIndex[key] { retryFileIndices.append(idx) }
+            activeDownloadTasks.removeValue(forKey: key)
+            activeTaskFileIndex.removeValue(forKey: key)
+            activeTaskBytes.removeValue(forKey: key)
+        }
+        if !keys.isEmpty { updateProgress() }
+        return keys.count
+    }
+    #endif
 
     /// A task failed transiently (network error, bad range response, 429 /
     /// 5xx). Runs on the main queue.
@@ -1072,10 +1235,15 @@ public final class ModelDownloader: NSObject {
         lastProgressLog = now
         let receiving = activeTaskBytes.filter { $0.value > 0 }
         let lanes = Set(receiving.keys.map(\.session)).count
-        print(String(format: "[Download] t+%.0fs %.0f / %.0f MB · %d of %d tasks receiving on %d lanes",
+        print(String(format: "[Download] t+%.0fs %.0f / %.0f MB · %d of %d tasks receiving on %d sessions",
                      now.timeIntervalSince(start), Double(bytes) / 1e6,
                      Double(totalBytesForAllFiles) / 1e6, receiving.count,
                      activeDownloadTasks.count, lanes))
+    }
+
+    private func count(_ index: Int, bytes: Int64) {
+        completedBytes += bytes - (countedBytes[index] ?? 0)
+        countedBytes[index] = bytes
     }
 
     private func updateProgress() {
@@ -1083,8 +1251,9 @@ public final class ModelDownloader: NSObject {
         let bytes = completedBytes + inFlight
         logProgressIfDue(inFlight: inFlight, bytes: bytes)
         let total = Double(max(totalBytesForAllFiles, 1))
-        progress = min(Double(bytes) / total, 0.99)
-        let mbDone = Double(bytes) / 1_000_000
+        shownBytesHighWater = max(shownBytesHighWater, bytes)
+        progress = min(Double(shownBytesHighWater) / total, 0.99)
+        let mbDone = Double(shownBytesHighWater) / 1_000_000
         let mbTotal = Double(totalBytesForAllFiles) / 1_000_000
         status = String(format: "%.0f / %.0f MB", mbDone, mbTotal)
 
@@ -1409,17 +1578,18 @@ public final class ModelDownloader: NSObject {
         totalBytesForAllFiles = state.totalBytes
         nextFileIndex = 0
         completedBytes = 0
+        countedBytes = [:]
         resetRetryState()
         downloadingModelId = model.id
         isDownloading = true
         isPaused = true
         // Scan completed bytes from disk for accurate progress
         if let dest = destDir {
-            for file in pendingFiles {
+            for (i, file) in pendingFiles.enumerated() {
                 let path = dest.appendingPathComponent(file.localPath).path
                 if let attrs = try? fileManager.attributesOfItem(atPath: path),
                    let size = attrs[.size] as? Int64, size > 0 {
-                    completedBytes += size
+                    count(i, bytes: size)
                 }
             }
         }
@@ -1618,6 +1788,7 @@ public final class ModelDownloader: NSObject {
         pendingFiles = Self.rangeSegmented(largeFiles + smallFiles)
         totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }
         completedBytes = 0
+        countedBytes = [:]
         nextFileIndex = 0
     }
 
@@ -1657,6 +1828,7 @@ public final class ModelDownloader: NSObject {
         pendingFiles.sort { $0.estimatedSize > $1.estimatedSize }
         totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }
         completedBytes = 0
+        countedBytes = [:]
         nextFileIndex = 0
     }
 
@@ -1707,6 +1879,7 @@ public final class ModelDownloader: NSObject {
         pendingFiles.sort { $0.estimatedSize > $1.estimatedSize }
         totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }
         completedBytes = 0
+        countedBytes = [:]
         nextFileIndex = 0
     }
 
@@ -1778,6 +1951,7 @@ public final class ModelDownloader: NSObject {
         pendingFiles.sort { $0.estimatedSize > $1.estimatedSize }
         totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }
         completedBytes = 0
+        countedBytes = [:]
         nextFileIndex = 0
     }
 
@@ -1870,6 +2044,7 @@ public final class ModelDownloader: NSObject {
         pendingFiles = largeFiles + smallFiles
         totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }
         completedBytes = 0
+        countedBytes = [:]
         nextFileIndex = 0
     }
 
@@ -1927,6 +2102,7 @@ public final class ModelDownloader: NSObject {
         pendingFiles = largeFiles + smallFiles
         totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }
         completedBytes = 0
+        countedBytes = [:]
         nextFileIndex = 0
     }
 
@@ -2127,10 +2303,12 @@ extension ModelDownloader: URLSessionDownloadDelegate {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.unparkRestoredDownloadIfNeeded()
+            let fileIndex = self.activeTaskFileIndex[taskId]
+                ?? self.pendingFiles.firstIndex { $0.localPath == localPath }
             self.activeDownloadTasks.removeValue(forKey: taskId)
             self.activeTaskFileIndex.removeValue(forKey: taskId)
             self.activeTaskBytes.removeValue(forKey: taskId)
-            self.completedBytes += downloadedSize
+            if let fileIndex { self.count(fileIndex, bytes: downloadedSize) }
             self.updateProgress()
 
             if isZip {
@@ -2153,7 +2331,9 @@ extension ModelDownloader: URLSessionDownloadDelegate {
                            totalBytesExpectedToWrite: Int64) {
         let taskId = Self.key(session, downloadTask)
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
+            // Only tasks we track: a late callback from a cancelled or
+            // not-yet-adopted task would park phantom bytes in the total.
+            guard let self, self.activeDownloadTasks[taskId] != nil else { return }
             self.activeTaskBytes[taskId] = totalBytesWritten
             self.updateProgress()
         }
