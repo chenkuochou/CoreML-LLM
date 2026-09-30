@@ -4,7 +4,7 @@ import UIKit
 #endif
 
 /// Downloads and caches CoreML models with background URLSession and pause/resume support.
-/// Uses up to 4 concurrent connections for faster HuggingFace downloads (~2x speedup).
+/// Large files are fetched as parallel HTTP Range segments (see `rangeSegmentSize`).
 @Observable
 public final class ModelDownloader: NSObject {
     public static let shared = ModelDownloader()
@@ -30,26 +30,48 @@ public final class ModelDownloader: NSObject {
     // MARK: - Private
 
     private let fileManager = FileManager.default
-    private var session: URLSession!
+    /// One background session per lane — see `laneCount`.
+    private var sessions: [URLSession] = []
     private var currentModel: ModelInfo?
     private var destDir: URL?
     private var pendingFiles: [DownloadFile] = []
     private var totalBytesForAllFiles: Int64 = 0
     private var downloadContinuation: CheckedContinuation<URL, Error>?
 
-    /// Set by the app delegate for background URL session events.
-    public var backgroundCompletionHandler: (() -> Void)?
+    /// System completion handlers from `handleEventsForBackgroundURLSession`,
+    /// keyed by session identifier (one per lane). Main queue only.
+    private var backgroundCompletionHandlers: [String: () -> Void] = [:]
     private static let sessionIdentifier = "com.coreml-llm.model-download"
 
+    /// Parallel background sessions ("lanes"). URLSession multiplexes every
+    /// task to a host over ONE HTTP/2 connection per session — however many
+    /// tasks, whatever `httpMaximumConnectionsPerHost` says — and HF's Xet
+    /// CDN caps each connection (1–9 MB/s from Sydney on a 250 Mbps line;
+    /// every request is an uncached pull from its US origin). Separate
+    /// sessions get separate connections: 1 session × 8 tasks 4.7 MB/s vs
+    /// 8 sessions 18.2 MB/s, measured back to back. Lane 0 keeps the
+    /// pre-lane identifier so tasks from older builds are still adopted.
+    private static let laneCount = 8
+    nonisolated static func laneIdentifier(_ lane: Int) -> String {
+        lane == 0 ? sessionIdentifier : "\(sessionIdentifier).lane\(lane)"
+    }
+
+    /// `taskIdentifier` is only unique within one session.
+    private struct TaskKey: Hashable {
+        let session: String
+        let id: Int
+    }
+    nonisolated private static func key(_ session: URLSession, _ task: URLSessionTask) -> TaskKey {
+        TaskKey(session: session.configuration.identifier ?? "", id: task.taskIdentifier)
+    }
+
     // Parallel download state. All pending files are enqueued with the
-    // session at once (see fillDownloadSlots); this constant only caps
-    // simultaneous connections via httpMaximumConnectionsPerHost.
-    private let maxConcurrentDownloads = 4
+    // sessions at once (see fillDownloadSlots).
     private var nextFileIndex = 0
     private var completedBytes: Int64 = 0
-    private var activeDownloadTasks: [Int: URLSessionDownloadTask] = [:]
-    private var activeTaskFileIndex: [Int: Int] = [:]
-    private var activeTaskBytes: [Int: Int64] = [:]
+    private var activeDownloadTasks: [TaskKey: URLSessionDownloadTask] = [:]
+    private var activeTaskFileIndex: [TaskKey: Int] = [:]
+    private var activeTaskBytes: [TaskKey: Int64] = [:]
 
     // Failed-file retry state. A task that dies with a transient error
     // (network handoff, system cancelling a background task) must put its
@@ -66,6 +88,7 @@ public final class ModelDownloader: NSObject {
     // adoption completes we defer download/resume so we don't spawn fresh
     // tasks that would race with — and double-download — the survivors.
     private var tasksAdopted = false
+    private var lanesAwaitingAdoption = 0
     private var pendingAdoptionActions: [() -> Void] = []
 
     // MARK: - Types
@@ -292,10 +315,20 @@ public final class ModelDownloader: NSObject {
         }
     }
 
-    private struct DownloadFile: Codable {
+    // Internal (not private) for the unit tests, like the three helpers
+    // `rangeSegmented` / `isValidRangeResponse` / `joinParts`.
+    struct DownloadFile: Codable, Equatable {
         let remotePath: String
         let localPath: String
         let estimatedSize: Int64
+        // Range segment of a larger file (see `rangeSegmented`). Optional so
+        // states persisted before segmentation still decode. `rangeEnd` is
+        // inclusive; nil = to end of file (the last segment absorbs any
+        // estimate error). `joinTarget` is the whole file's localPath —
+        // `finishDownload` concatenates its segments into it.
+        var rangeStart: Int64? = nil
+        var rangeEnd: Int64? = nil
+        var joinTarget: String? = nil
     }
 
     private struct PersistedState: Codable {
@@ -312,27 +345,56 @@ public final class ModelDownloader: NSObject {
         var modelName: String?
     }
 
-    // MARK: - Split embed (gemma4-e2b-3way-split)
+    // MARK: - Range segments + joins
 
-    /// A lone 2.35 GB `embed_tokens_per_layer_q8.bin` pins the download tail
-    /// to a single connection at the CDN's per-stream cap (~30 MB/s observed
-    /// vs ~50 MB/s for 4 parallel streams on a ~500 Mbps link). The
-    /// `gemma4-e2b-3way-split` id downloads it as 4 equal 587,202,560-byte
-    /// parts (byte-identical slices, hosted alongside the whole file on
-    /// mirrors that opt in) and `finishDownload` re-joins them. Non-split ids
-    /// are untouched — they keep fetching the single file.
+    /// Files of at least twice this size download as parallel HTTP Range
+    /// segments of this size (`<localPath>.segNN`), and `finishDownload`
+    /// concatenates them. A whole file rides one connection at the CDN's
+    /// per-connection cap and pins the install tail (a lone 2.35 GB embed
+    /// did), and a transient failure costs one segment instead of the file.
+    static let rangeSegmentSize: Int64 = 64 * 1024 * 1024
+
+    /// Expand large files into Range segments. The count rounds the estimate
+    /// down and the last segment is open-ended, so an estimate that's off by
+    /// less than one segment still covers the file exactly.
+    static func rangeSegmented(_ files: [DownloadFile]) -> [DownloadFile] {
+        files.flatMap { file -> [DownloadFile] in
+            let count = file.estimatedSize / rangeSegmentSize
+            guard count >= 2 else { return [file] }
+            return (0..<count).map { i in
+                let start = i * rangeSegmentSize
+                let isLast = i == count - 1
+                return DownloadFile(
+                    remotePath: file.remotePath,
+                    localPath: file.localPath + String(format: ".seg%02ld", Int(i)),
+                    estimatedSize: isLast ? file.estimatedSize - start : rangeSegmentSize,
+                    rangeStart: start,
+                    rangeEnd: isLast ? nil : start + rangeSegmentSize - 1,
+                    joinTarget: file.localPath)
+            }
+        }
+    }
+
+    /// Legacy split-embed parts: builds before Range segments fetched the
+    /// 2.35 GB per-layer embed as 4 mirror-hosted `.partN` files. Fresh
+    /// downloads no longer list them, but a state persisted mid-download by
+    /// such a build still does, and they must still join.
     private static let splitEmbedJoinedName = "embed_tokens_per_layer_q8.bin"
-    private static let splitEmbedPartCount = 4
-    private static let splitEmbedPartSize: Int64 = 587_202_560
 
     nonisolated private static func isSplitEmbedPart(_ localPath: String) -> Bool {
         localPath.hasPrefix(splitEmbedJoinedName + ".part")
     }
 
+    /// The whole file a piece concatenates into; nil for a plain file.
+    private static func joinTarget(of file: DownloadFile) -> String? {
+        if let target = file.joinTarget { return target }
+        return isSplitEmbedPart(file.localPath) ? splitEmbedJoinedName : nil
+    }
+
     /// Guards against a second `finishDownload` (e.g. a re-attached caller
     /// triggering `resumeDownload`) dispatching a concurrent join over the
-    /// same temp file while one is already in flight.
-    private var isJoiningSplitEmbed = false
+    /// same temp files while one is already in flight.
+    private var isJoiningParts = false
 
     // MARK: - Init
 
@@ -340,15 +402,30 @@ public final class ModelDownloader: NSObject {
         super.init()
         cleanGraveyard()
         restorePendingDownload()
-        let config = URLSessionConfiguration.background(withIdentifier: Self.sessionIdentifier)
-        config.isDiscretionary = false
-        config.sessionSendsLaunchEvents = true
-        config.timeoutIntervalForResource = 7200
-        config.httpMaximumConnectionsPerHost = maxConcurrentDownloads
-        session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
-        session.getAllTasks { [weak self] tasks in
-            DispatchQueue.main.async { self?.adoptExistingTasks(tasks) }
+        sessions = (0..<Self.laneCount).map { lane in
+            let config = URLSessionConfiguration.background(withIdentifier: Self.laneIdentifier(lane))
+            config.isDiscretionary = false
+            config.sessionSendsLaunchEvents = true
+            config.timeoutIntervalForResource = 7200
+            // HTTP/2 ignores this; it bounds an HTTP/1.1 fallback.
+            config.httpMaximumConnectionsPerHost = 2
+            return URLSession(configuration: config, delegate: self, delegateQueue: nil)
         }
+        lanesAwaitingAdoption = sessions.count
+        for session in sessions {
+            session.getAllTasks { [weak self] tasks in
+                DispatchQueue.main.async { self?.adoptExistingTasks(tasks, in: session) }
+            }
+        }
+    }
+
+    /// The app delegate's `handleEventsForBackgroundURLSession` hands its
+    /// completion handler here; it runs once that session's queued events
+    /// are delivered. Each lane is its own session, so a wake can deliver
+    /// several — keep one handler per identifier.
+    public func setBackgroundCompletionHandler(_ handler: @escaping () -> Void,
+                                               forSession identifier: String) {
+        backgroundCompletionHandlers[identifier] = handler
     }
 
     /// Claim background tasks that survived a prior app process. Tasks whose
@@ -357,19 +434,23 @@ public final class ModelDownloader: NSObject {
     /// (different model, stale state) and gets cancelled. Without this,
     /// `resumeDownload` would create a second task for the same file and
     /// `completedBytes` would be counted twice.
-    private func adoptExistingTasks(_ tasks: [URLSessionTask]) {
+    private func adoptExistingTasks(_ tasks: [URLSessionTask], in session: URLSession) {
         var pathToIndex: [String: Int] = [:]
         for (i, f) in pendingFiles.enumerated() { pathToIndex[f.localPath] = i }
         for t in tasks {
             if let dl = t as? URLSessionDownloadTask,
                let desc = t.taskDescription,
-               let idx = pathToIndex[desc] {
-                activeDownloadTasks[t.taskIdentifier] = dl
-                activeTaskFileIndex[t.taskIdentifier] = idx
+               let idx = pathToIndex[desc],
+               !activeTaskFileIndex.values.contains(idx) {
+                let key = Self.key(session, t)
+                activeDownloadTasks[key] = dl
+                activeTaskFileIndex[key] = idx
             } else {
                 t.cancel()
             }
         }
+        lanesAwaitingAdoption -= 1
+        guard lanesAwaitingAdoption == 0 else { return }
         tasksAdopted = true
         let actions = pendingAdoptionActions
         pendingAdoptionActions.removeAll()
@@ -790,11 +871,11 @@ public final class ModelDownloader: NSObject {
         // hand the same file to a second task and double-count its bytes.
         var activeIndices = Set(activeTaskFileIndex.values)
 
-        // Hand EVERY remaining file to the background session up front.
-        // nsurlsessiond runs them while the app is suspended (concurrency is
-        // still bounded by httpMaximumConnectionsPerHost). The old cap of
-        // `maxConcurrentDownloads` in-flight tasks meant each refill needed an
-        // in-process call — i.e. an app wake per batch of 4 when backgrounded.
+        // Hand EVERY remaining file to the background sessions up front.
+        // nsurlsessiond runs them while the app is suspended (each lane's
+        // tasks share that lane's connection). The old cap of 4 in-flight
+        // tasks meant each refill needed an in-process call — i.e. an app
+        // wake per batch of 4 when backgrounded.
         // iOS rate-limits background-session wakes, so a ~50-file bundle
         // crawled for hours in the background and the download-complete
         // notification never fired.
@@ -826,11 +907,11 @@ public final class ModelDownloader: NSObject {
                 }
             }
 
-            // Split-embed part whose joined output already exists (repair
-            // sweep over a completed install): the join consumed the parts,
-            // so their absence is expected — satisfied, no network.
-            if Self.isSplitEmbedPart(file.localPath),
-               fileManager.fileExists(atPath: dest.appendingPathComponent(Self.splitEmbedJoinedName).path) {
+            // Segment whose joined file already exists (repair sweep over a
+            // completed install): the join consumed it, so its absence is
+            // expected — satisfied, no network.
+            if let target = Self.joinTarget(of: file),
+               fileManager.fileExists(atPath: dest.appendingPathComponent(target).path) {
                 completedBytes += file.estimatedSize
                 updateProgress()
                 continue
@@ -851,12 +932,23 @@ public final class ModelDownloader: NSObject {
             try? fileManager.createDirectory(at: destFile.deletingLastPathComponent(),
                                               withIntermediateDirectories: true)
 
-            let task = session.downloadTask(with: url)
+            var request = URLRequest(url: url)
+            if let start = file.rangeStart {
+                let end = file.rangeEnd.map { String($0) } ?? ""
+                request.setValue("bytes=\(start)-\(end)", forHTTPHeaderField: "Range")
+                // Offsets index the raw file, never a compressed body.
+                request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+            }
+            // Consecutive indices (a file's segments) land on different
+            // lanes, i.e. different connections.
+            let lane = sessions[idx % sessions.count]
+            let task = lane.downloadTask(with: request)
             task.taskDescription = file.localPath
             task.resume()
 
-            activeDownloadTasks[task.taskIdentifier] = task
-            activeTaskFileIndex[task.taskIdentifier] = idx
+            let key = Self.key(lane, task)
+            activeDownloadTasks[key] = task
+            activeTaskFileIndex[key] = idx
             activeIndices.insert(idx)
         }
 
@@ -883,6 +975,76 @@ public final class ModelDownloader: NSObject {
         if isPaused && downloadContinuation == nil {
             isPaused = false
         }
+    }
+
+    /// A task failed transiently (network error, bad range response, 429 /
+    /// 5xx). Runs on the main queue.
+    private func handleTaskFailure(taskId: TaskKey, error: Error) {
+        unparkRestoredDownloadIfNeeded()
+        let fileIndex = activeTaskFileIndex[taskId]
+        activeDownloadTasks.removeValue(forKey: taskId)
+        activeTaskFileIndex.removeValue(forKey: taskId)
+        activeTaskBytes.removeValue(forKey: taskId)
+
+        // Re-queue the failed file (bounded). Without this the file is
+        // lost — nextFileIndex already advanced past it — and the
+        // download "succeeds" minus one file, which the model only
+        // notices at load time ("…couldn't be opened because there is
+        // no such file"). Background sessions hit transient task
+        // failures routinely, so this is the common path, not the edge.
+        if let idx = fileIndex, idx < pendingFiles.count {
+            let attempts = (fileRetryCounts[idx] ?? 0) + 1
+            fileRetryCounts[idx] = attempts
+            if attempts <= maxRetriesPerFile {
+                print("[Download] Retry \(attempts)/\(maxRetriesPerFile) for \(pendingFiles[idx].localPath): \(error.localizedDescription)")
+                retryFileIndices.append(idx)
+                fillDownloadSlots()
+                return
+            }
+        }
+
+        // Retries exhausted for this file. If other work remains, keep
+        // going — the completeness sweep in finishDownload will surface
+        // the gap; otherwise fail the download with the real error.
+        if !activeDownloadTasks.isEmpty
+            || nextFileIndex < pendingFiles.count
+            || !retryFileIndices.isEmpty {
+            fillDownloadSlots()
+            return
+        }
+
+        status = "Error: \(error.localizedDescription)"
+        isDownloading = false
+        isPaused = false
+        downloadingModelId = nil
+        cleanupPersistedState()
+        downloadContinuation?.resume(throwing: error)
+        downloadContinuation = nil
+    }
+
+    /// `requested` is `bytes=START-END` or `bytes=START-`. Valid = a 206
+    /// whose `Content-Range: bytes A-B/TOTAL` ends at END (or TOTAL-1 when
+    /// open-ended) and a body of exactly the requested span. A may exceed
+    /// START: after a dropped connection nsurlsessiond resumes the task by
+    /// itself with a narrower Range, stitches the bytes, and reports only
+    /// that last response (seen on device: asked 1879048192-, got 206
+    /// "1929975452-…", full 64 MiB body) — the body length is the check.
+    nonisolated static func isValidRangeResponse(
+        _ http: HTTPURLResponse?, requested: String, bodySize: Int64
+    ) -> Bool {
+        guard let http, http.statusCode == 206,
+              let contentRange = http.value(forHTTPHeaderField: "Content-Range"),
+              requested.hasPrefix("bytes="), contentRange.hasPrefix("bytes ") else { return false }
+        let req = requested.dropFirst("bytes=".count)
+            .split(separator: "-", omittingEmptySubsequences: false)
+        let span = contentRange.dropFirst("bytes ".count).split(separator: "/")
+        guard req.count == 2, let reqStart = Int64(req[0]),
+              span.count == 2, let total = Int64(span[1]) else { return false }
+        let got = span[0].split(separator: "-")
+        guard got.count == 2, let start = Int64(got[0]), let end = Int64(got[1]) else { return false }
+        guard let expectedEnd = req[1].isEmpty ? total - 1 : Int64(req[1]) else { return false }
+        return start >= reqStart && start <= end && end == expectedEnd
+            && bodySize == expectedEnd - reqStart + 1
     }
 
     private func updateProgress() {
@@ -942,9 +1104,9 @@ public final class ModelDownloader: NSObject {
             let f = pendingFiles[idx]
             if f.localPath == "__archive.zip" { return false }  // deleted after extraction
             if isOptionalMlmodelcFile(f.localPath) { return false }  // legitimately 404s
-            // A consumed split-embed part is satisfied by its joined output.
-            if Self.isSplitEmbedPart(f.localPath),
-               fileManager.fileExists(atPath: dest.appendingPathComponent(Self.splitEmbedJoinedName).path) {
+            // A consumed segment is satisfied by its joined output.
+            if let target = Self.joinTarget(of: f),
+               fileManager.fileExists(atPath: dest.appendingPathComponent(target).path) {
                 return false
             }
             return !fileManager.fileExists(atPath: dest.appendingPathComponent(f.localPath).path)
@@ -972,23 +1134,25 @@ public final class ModelDownloader: NSObject {
             return
         }
 
-        // Split-embed join: multi-GB sequential file I/O, so hop off the
-        // main queue (same pattern as the zip-extraction path) and re-enter
-        // the completion tail on main when done. `isJoiningSplitEmbed`
-        // guards a second finishDownload (e.g. a re-attached caller's
-        // resumeDownload) from racing a concurrent join over the same temp.
-        let joinedURL = dest.appendingPathComponent(Self.splitEmbedJoinedName)
-        let firstPartURL = dest.appendingPathComponent("\(Self.splitEmbedJoinedName).part1")
-        if !fileManager.fileExists(atPath: joinedURL.path),
-           fileManager.fileExists(atPath: firstPartURL.path) {
-            guard !isJoiningSplitEmbed else { return }
-            isJoiningSplitEmbed = true
+        // Segment joins: multi-GB sequential file I/O, so hop off the main
+        // queue (same pattern as the zip-extraction path) and re-enter the
+        // completion tail on main when done. `isJoiningParts` guards a
+        // second finishDownload (e.g. a re-attached caller's resumeDownload)
+        // from racing a concurrent join over the same temps.
+        let joins = pendingJoins(in: dest)
+        if !joins.isEmpty {
+            guard !isJoiningParts else { return }
+            isJoiningParts = true
             status = "Assembling..."
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                let joinError = Self.joinSplitEmbedParts(in: dest)
+                var joinError: Error?
+                for job in joins {
+                    joinError = Self.joinParts(job.parts, into: job.target)
+                    if joinError != nil { break }
+                }
                 DispatchQueue.main.async {
                     guard let self else { return }
-                    self.isJoiningSplitEmbed = false
+                    self.isJoiningParts = false
                     if let joinError {
                         self.status = "Error: couldn't assemble model files"
                         self.isDownloading = false
@@ -1004,21 +1168,42 @@ public final class ModelDownloader: NSObject {
             }
             return
         }
-        // Stray parts next to an existing joined file (crash between the
-        // join's rename and its part cleanup): finish the cleanup here.
-        if fileManager.fileExists(atPath: joinedURL.path) {
-            for i in 1...Self.splitEmbedPartCount {
-                let part = dest.appendingPathComponent("\(Self.splitEmbedJoinedName).part\(i)")
-                if fileManager.fileExists(atPath: part.path) {
-                    try? fileManager.removeItem(at: part)
-                }
-            }
-        }
 
         completeDownload(model: model, dest: dest)
     }
 
-    /// Everything after the completeness sweep + split-embed join: prefill
+    /// Join targets not yet assembled, each with its pieces in file order
+    /// (`rangeSegmented` emits a file's segments contiguously, and legacy
+    /// parts were listed part1…part4). chunk1's weight — the file
+    /// `localModelURL` keys "bundle present" on — joins last, so a kill
+    /// mid-join can't leave the folder looking complete. Pieces lingering
+    /// beside an already-joined target (e.g. a task adopted from a prior
+    /// process landing after the join) are deleted here.
+    private func pendingJoins(in dest: URL) -> [(target: URL, parts: [URL])] {
+        var order: [String] = []
+        var parts: [String: [URL]] = [:]
+        for f in pendingFiles {
+            guard let target = Self.joinTarget(of: f) else { continue }
+            if parts[target] == nil { order.append(target) }
+            parts[target, default: []].append(dest.appendingPathComponent(f.localPath))
+        }
+        if let i = order.firstIndex(of: "chunk1.mlmodelc/weights/weight.bin") {
+            order.append(order.remove(at: i))
+        }
+        return order.compactMap { target in
+            let targetURL = dest.appendingPathComponent(target)
+            let pieces = parts[target] ?? []
+            if fileManager.fileExists(atPath: targetURL.path) {
+                for p in pieces where fileManager.fileExists(atPath: p.path) {
+                    try? fileManager.removeItem(at: p)
+                }
+                return nil
+            }
+            return (targetURL, pieces)
+        }
+    }
+
+    /// Everything after the completeness sweep + segment joins: prefill
     /// weight sharing, stray-directory cleanup, and resuming the caller.
     /// Runs on the main queue.
     private func completeDownload(model: ModelInfo, dest: URL) {
@@ -1091,33 +1276,31 @@ public final class ModelDownloader: NSObject {
         downloadContinuation = nil
     }
 
-    /// Re-join the split-embed parts into `embed_tokens_per_layer_q8.bin`.
-    /// Crash-safe: appends into a `.joining` temp (each part deleted right
-    /// after it's consumed, capping transient disk at ~one part), renamed to
-    /// the final name only after every part is in. A crash mid-join leaves a
-    /// stale temp plus missing consumed parts — the caller's completeness
-    /// sweep re-fetches exactly those parts on the next repair pass and the
-    /// join restarts from scratch. Pure file I/O; runs off the main queue.
-    nonisolated private static func joinSplitEmbedParts(in dest: URL) -> Error? {
+    /// Concatenate `parts` (in order) into `target`. Crash-safe: the first
+    /// part is renamed to a `.joining` temp (no copy) and the rest appended,
+    /// each deleted right after it's consumed (transient disk ≈ one part);
+    /// the temp takes the final name only after every part is in. A crash
+    /// mid-join leaves a stale temp plus missing consumed parts — the
+    /// caller's completeness sweep re-fetches exactly those parts on the
+    /// next repair pass and the join restarts from scratch. Pure file I/O;
+    /// runs off the main queue.
+    nonisolated static func joinParts(_ parts: [URL], into target: URL) -> Error? {
         let fm = FileManager.default
-        let joined = dest.appendingPathComponent(splitEmbedJoinedName)
-        let parts = (1...splitEmbedPartCount).map {
-            dest.appendingPathComponent("\(splitEmbedJoinedName).part\($0)")
-        }
-        guard parts.allSatisfy({ fm.fileExists(atPath: $0.path) }) else {
-            // Caller only dispatches with part1 present after the sweep
-            // passed, so this is defensive.
+        guard let first = parts.first, parts.allSatisfy({ fm.fileExists(atPath: $0.path) }) else {
+            // Caller only dispatches after the completeness sweep passed, so
+            // this is defensive.
             return NSError(domain: "CoreMLLLM.ModelDownloader", code: -4, userInfo: [
                 NSLocalizedDescriptionKey: "Model file parts are incomplete. Please retry the download.",
             ])
         }
-        let temp = dest.appendingPathComponent(splitEmbedJoinedName + ".joining")
+        let temp = target.appendingPathExtension("joining")
         try? fm.removeItem(at: temp)  // stale temp from a crashed join
         do {
-            fm.createFile(atPath: temp.path, contents: nil)
+            try fm.moveItem(at: first, to: temp)
             let out = try FileHandle(forWritingTo: temp)
             defer { try? out.close() }
-            for part in parts {
+            try out.seekToEnd()
+            for part in parts.dropFirst() {
                 let input = try FileHandle(forReadingFrom: part)
                 defer { try? input.close() }
                 while true {
@@ -1133,14 +1316,14 @@ public final class ModelDownloader: NSObject {
                 try fm.removeItem(at: part)
             }
             try out.close()
-            try fm.moveItem(at: temp, to: joined)
-            print("[Download] Joined \(parts.count) split-embed parts → \(splitEmbedJoinedName)")
+            try fm.moveItem(at: temp, to: target)
+            print("[Download] Joined \(parts.count) parts → \(target.lastPathComponent)")
             return nil
         } catch {
             try? fm.removeItem(at: temp)
             return NSError(domain: "CoreMLLLM.ModelDownloader", code: -4, userInfo: [
                 NSLocalizedDescriptionKey:
-                    "Couldn't assemble \(splitEmbedJoinedName) from its parts: "
+                    "Couldn't assemble \(target.lastPathComponent) from its parts: "
                     + "\(error.localizedDescription). Free up storage and retry.",
             ])
         }
@@ -1283,17 +1466,17 @@ public final class ModelDownloader: NSObject {
         // for a -45 MB bundle delta. The legacy gemma4e2b entry still
         // pulls chunk2/3/4 for backward-compat with apps that haven't
         // upgraded to the 3-chunk loader path.
-        // The -split variant is the 3way layout with the per-layer embed
-        // fetched as 4 parts (see the split-embed constants above). Only
-        // mirrors that host the part files can serve it — Evie's does.
+        // The -split variant is the 3way layout (Evie's mirror-pinned id).
+        // It used to fetch the per-layer embed as 4 mirror-hosted parts;
+        // Range segments (`rangeSegmented`) now split every large file, so
+        // it downloads exactly like -3way.
         let is3Way = (model.id == "gemma4-e2b-3way" || model.id == "gemma4-e2b-3way-split")
-        let splitEmbed = (model.id == "gemma4-e2b-3way-split")
         var chunkFiles = mlc("swa", "chunk1", "chunk1", weightSize: 155_436_864)
         if is3Way {
             chunkFiles += mlc("swa", "chunk2_3way", "chunk2_3way",
-                              weightSize: 459_900_000)  // ~438.6 MB observed
+                              weightSize: 459_245_120)
             chunkFiles += mlc("swa", "chunk3_3way", "chunk3_3way",
-                              weightSize: 527_000_000)  // ~502.8 MB observed
+                              weightSize: 526_874_880)
         } else {
             chunkFiles += mlc("swa", "chunk2", "chunk2", weightSize: 133_963_968)
             chunkFiles += mlc("swa", "chunk3", "chunk3", weightSize: 325_282_880)
@@ -1371,22 +1554,12 @@ public final class ModelDownloader: NSObject {
         ]
 
         // 2.35 GB per-layer embeddings — the biggest single file in the
-        // bundle. Split ids fetch it as 4 parts so it doesn't pin the
-        // download tail to one connection; finishDownload re-joins them.
-        let perLayerEmbedFiles: [DownloadFile]
-        if splitEmbed {
-            perLayerEmbedFiles = (1...Self.splitEmbedPartCount).map {
-                .init(remotePath: "\(Self.splitEmbedJoinedName).part\($0)",
-                      localPath: "\(Self.splitEmbedJoinedName).part\($0)",
-                      estimatedSize: Self.splitEmbedPartSize)
-            }
-        } else {
-            perLayerEmbedFiles = [
-                .init(remotePath: Self.splitEmbedJoinedName,
-                      localPath: Self.splitEmbedJoinedName,
-                      estimatedSize: 2_348_810_240)
-            ]
-        }
+        // bundle; `rangeSegmented` below fetches it in parallel pieces.
+        let perLayerEmbedFiles: [DownloadFile] = [
+            .init(remotePath: Self.splitEmbedJoinedName,
+                  localPath: Self.splitEmbedJoinedName,
+                  estimatedSize: 2_348_810_240)
+        ]
 
         // Default: include multimodal (full bundle). User opts out via
         // ModelPickerView's "Include multimodal" toggle (UserDefaults).
@@ -1407,9 +1580,10 @@ public final class ModelDownloader: NSObject {
             }
         }
 
-        // Large files first (sorted biggest-first) so all 4 connections saturate immediately
+        // Large files first (sorted biggest-first), each split into Range
+        // segments so every connection stays busy through the tail.
         largeFiles.sort { $0.estimatedSize > $1.estimatedSize }
-        pendingFiles = largeFiles + smallFiles
+        pendingFiles = Self.rangeSegmented(largeFiles + smallFiles)
         totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }
         completedBytes = 0
         nextFileIndex = 0
@@ -1830,7 +2004,7 @@ extension ModelDownloader: URLSessionDownloadDelegate {
                 .prefix(200).trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             try? fileManager.removeItem(at: location)
             let url = downloadTask.originalRequest?.url?.absoluteString ?? "(unknown)"
-            let taskId = downloadTask.taskIdentifier
+            let taskId = Self.key(session, downloadTask)
 
             // Optional files: metadata.json and analytics/coremldata.bin inside
             // an mlmodelc are descriptive, not functional — CoreML loads fine
@@ -1845,6 +2019,18 @@ extension ModelDownloader: URLSessionDownloadDelegate {
                     self.activeTaskFileIndex.removeValue(forKey: taskId)
                     self.activeTaskBytes.removeValue(forKey: taskId)
                     self.fillDownloadSlots()
+                }
+                return
+            }
+
+            // Rate limiting and server hiccups are transient — re-queue
+            // through the bounded retry path instead of failing the install.
+            // Range segments multiply the request count, so this matters.
+            if http.statusCode == 429 || http.statusCode >= 500 {
+                let err = NSError(domain: "CoreMLLLM.ModelDownloader", code: http.statusCode,
+                                  userInfo: [NSLocalizedDescriptionKey: "HTTP \(http.statusCode) fetching \(url)"])
+                DispatchQueue.main.async { [weak self] in
+                    self?.handleTaskFailure(taskId: taskId, error: err)
                 }
                 return
             }
@@ -1871,6 +2057,29 @@ extension ModelDownloader: URLSessionDownloadDelegate {
             return
         }
 
+        // Range segment: the body must be exactly the bytes asked for. A
+        // server or redirect hop that ignores Range answers 200 with the
+        // whole file, which would corrupt the join — accept only a 206 whose
+        // Content-Range matches the request and the body length, else retry.
+        if let requested = downloadTask.originalRequest?.value(forHTTPHeaderField: "Range") {
+            let http = downloadTask.response as? HTTPURLResponse
+            let bodySize = (try? fileManager.attributesOfItem(atPath: location.path))?[.size] as? Int64 ?? -1
+            if !Self.isValidRangeResponse(http, requested: requested, bodySize: bodySize) {
+                try? fileManager.removeItem(at: location)
+                let taskId = Self.key(session, downloadTask)
+                let contentRange = http?.value(forHTTPHeaderField: "Content-Range") ?? "none"
+                let err = NSError(domain: "CoreMLLLM.ModelDownloader", code: -5, userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "Unexpected response for \(localPath) (\(requested)): HTTP "
+                        + "\(http?.statusCode ?? 0), Content-Range \(contentRange), \(bodySize) bytes",
+                ])
+                DispatchQueue.main.async { [weak self] in
+                    self?.handleTaskFailure(taskId: taskId, error: err)
+                }
+                return
+            }
+        }
+
         let destFile = dest.appendingPathComponent(localPath)
 
         // Must move synchronously before this method returns
@@ -1881,7 +2090,7 @@ extension ModelDownloader: URLSessionDownloadDelegate {
 
         let downloadedSize = (try? fileManager.attributesOfItem(atPath: destFile.path))?[.size] as? Int64 ?? 0
         let isZip = localPath == "__archive.zip"
-        let taskId = downloadTask.taskIdentifier
+        let taskId = Self.key(session, downloadTask)
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -1910,7 +2119,7 @@ extension ModelDownloader: URLSessionDownloadDelegate {
     public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                            didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
                            totalBytesExpectedToWrite: Int64) {
-        let taskId = downloadTask.taskIdentifier
+        let taskId = Self.key(session, downloadTask)
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.activeTaskBytes[taskId] = totalBytesWritten
@@ -1920,7 +2129,7 @@ extension ModelDownloader: URLSessionDownloadDelegate {
 
     public func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         guard let error else { return }
-        let taskId = task.taskIdentifier
+        let taskId = Self.key(session, task)
         if (error as NSError).code == NSURLErrorCancelled {
             DispatchQueue.main.async { [weak self] in
                 self?.activeDownloadTasks.removeValue(forKey: taskId)
@@ -1931,54 +2140,14 @@ extension ModelDownloader: URLSessionDownloadDelegate {
         }
 
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.unparkRestoredDownloadIfNeeded()
-            let fileIndex = self.activeTaskFileIndex[taskId]
-            self.activeDownloadTasks.removeValue(forKey: taskId)
-            self.activeTaskFileIndex.removeValue(forKey: taskId)
-            self.activeTaskBytes.removeValue(forKey: taskId)
-
-            // Re-queue the failed file (bounded). Without this the file is
-            // lost — nextFileIndex already advanced past it — and the
-            // download "succeeds" minus one file, which the model only
-            // notices at load time ("…couldn't be opened because there is
-            // no such file"). Background sessions hit transient task
-            // failures routinely, so this is the common path, not the edge.
-            if let idx = fileIndex, idx < self.pendingFiles.count {
-                let attempts = (self.fileRetryCounts[idx] ?? 0) + 1
-                self.fileRetryCounts[idx] = attempts
-                if attempts <= self.maxRetriesPerFile {
-                    print("[Download] Retry \(attempts)/\(self.maxRetriesPerFile) for \(self.pendingFiles[idx].localPath): \(error.localizedDescription)")
-                    self.retryFileIndices.append(idx)
-                    self.fillDownloadSlots()
-                    return
-                }
-            }
-
-            // Retries exhausted for this file. If other work remains, keep
-            // going — the completeness sweep in finishDownload will surface
-            // the gap; otherwise fail the download with the real error.
-            if !self.activeDownloadTasks.isEmpty
-                || self.nextFileIndex < self.pendingFiles.count
-                || !self.retryFileIndices.isEmpty {
-                self.fillDownloadSlots()
-                return
-            }
-
-            self.status = "Error: \(error.localizedDescription)"
-            self.isDownloading = false
-            self.isPaused = false
-            self.downloadingModelId = nil
-            self.cleanupPersistedState()
-            self.downloadContinuation?.resume(throwing: error)
-            self.downloadContinuation = nil
+            self?.handleTaskFailure(taskId: taskId, error: error)
         }
     }
 
     public func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
+        guard let identifier = session.configuration.identifier else { return }
         DispatchQueue.main.async { [weak self] in
-            self?.backgroundCompletionHandler?()
-            self?.backgroundCompletionHandler = nil
+            self?.backgroundCompletionHandlers.removeValue(forKey: identifier)?()
         }
     }
 }

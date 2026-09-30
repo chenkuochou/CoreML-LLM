@@ -19,7 +19,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication,
                      handleEventsForBackgroundURLSession identifier: String,
                      completionHandler: @escaping () -> Void) {
-        ModelDownloader.shared.backgroundCompletionHandler = completionHandler
+        ModelDownloader.shared.setBackgroundCompletionHandler(completionHandler, forSession: identifier)
     }
 }
 #endif
