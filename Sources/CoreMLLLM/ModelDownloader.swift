@@ -49,9 +49,12 @@ public final class ModelDownloader: NSObject {
     /// CDN caps each connection (1–9 MB/s from Sydney on a 250 Mbps line;
     /// every request is an uncached pull from its US origin). Separate
     /// sessions get separate connections: 1 session × 8 tasks 4.7 MB/s vs
-    /// 8 sessions 18.2 MB/s, measured back to back. Lane 0 keeps the
-    /// pre-lane identifier so tasks from older builds are still adopted.
-    private static let laneCount = 8
+    /// 8 sessions 18.2 MB/s, measured back to back. Six, not more: on an
+    /// iPhone 16e nsurlsessiond ran at most 6 lanes at once — with 8, two
+    /// sat idle for 4 minutes and only started once others drained, which
+    /// just stretched the tail. Lane 0 keeps the pre-lane identifier so
+    /// tasks from older builds are still adopted.
+    private static let laneCount = 6
     nonisolated static func laneIdentifier(_ lane: Int) -> String {
         lane == 0 ? sessionIdentifier : "\(sessionIdentifier).lane\(lane)"
     }
@@ -89,6 +92,11 @@ public final class ModelDownloader: NSObject {
     // tasks that would race with — and double-download — the survivors.
     private var tasksAdopted = false
     private var lanesAwaitingAdoption = 0
+
+    // Console timing breadcrumbs (`logProgressIfDue`).
+    private var progressLogStart: Date?
+    private var lastProgressLog: Date?
+    private var loggedFirstBytes = false
     private var pendingAdoptionActions: [() -> Void] = []
 
     // MARK: - Types
@@ -708,6 +716,9 @@ public final class ModelDownloader: NSObject {
                     self.isPaused = false
                     self.progress = 0
                     self.status = "Starting..."
+                    self.progressLogStart = Date()
+                    self.lastProgressLog = nil
+                    self.loggedFirstBytes = false
                     self.resetRetryState()
 
                     let dest = self.modelsDirectory.appendingPathComponent(model.folderName)
@@ -1047,9 +1058,30 @@ public final class ModelDownloader: NSObject {
             && bodySize == expectedEnd - reqStart + 1
     }
 
+    /// A console line at first byte and every 5 s after. nsurlsessiond can
+    /// sit on queued tasks before any byte moves, and a UI stuck at 0% can't
+    /// tell "slow" from "not started" — this is the record that can.
+    private func logProgressIfDue(inFlight: Int64, bytes: Int64) {
+        guard let start = progressLogStart else { return }
+        let now = Date()
+        if !loggedFirstBytes, inFlight > 0 {
+            loggedFirstBytes = true
+            print(String(format: "[Download] first bytes after %.1f s", now.timeIntervalSince(start)))
+        }
+        if let last = lastProgressLog, now.timeIntervalSince(last) < 5 { return }
+        lastProgressLog = now
+        let receiving = activeTaskBytes.filter { $0.value > 0 }
+        let lanes = Set(receiving.keys.map(\.session)).count
+        print(String(format: "[Download] t+%.0fs %.0f / %.0f MB · %d of %d tasks receiving on %d lanes",
+                     now.timeIntervalSince(start), Double(bytes) / 1e6,
+                     Double(totalBytesForAllFiles) / 1e6, receiving.count,
+                     activeDownloadTasks.count, lanes))
+    }
+
     private func updateProgress() {
         let inFlight = activeTaskBytes.values.reduce(0 as Int64, +)
         let bytes = completedBytes + inFlight
+        logProgressIfDue(inFlight: inFlight, bytes: bytes)
         let total = Double(max(totalBytesForAllFiles, 1))
         progress = min(Double(bytes) / total, 0.99)
         let mbDone = Double(bytes) / 1_000_000
