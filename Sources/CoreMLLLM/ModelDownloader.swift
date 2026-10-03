@@ -143,13 +143,38 @@ public final class ModelDownloader: NSObject {
         public let size: String
         public let downloadURL: String
         public let folderName: String
+        /// An explicit flat file list, for bundles this downloader has no
+        /// built-in layout for (e.g. a `.litertlm` plus a voice model). When
+        /// set, the download is exactly these files — Range-segmented and
+        /// joined like every other large file — and `localModelURL` returns
+        /// the model folder once every file is on disk at its exact size.
+        public let files: [File]?
 
-        public init(id: String, name: String, size: String, downloadURL: String, folderName: String) {
+        /// One file of an explicit list. `remotePath` is relative to
+        /// `downloadURL`, or an absolute `https://` URL (a file pinned in
+        /// another repo). `size` is the exact byte count: it plans the Range
+        /// segments and is the completeness check, so a truncated join never
+        /// passes as installed.
+        public struct File: Codable, Sendable, Equatable {
+            public let remotePath: String
+            public let localPath: String
+            public let size: Int64
+
+            public init(remotePath: String, localPath: String, size: Int64) {
+                self.remotePath = remotePath
+                self.localPath = localPath
+                self.size = size
+            }
+        }
+
+        public init(id: String, name: String, size: String, downloadURL: String, folderName: String,
+                    files: [File]? = nil) {
             self.id = id
             self.name = name
             self.size = size
             self.downloadURL = downloadURL
             self.folderName = folderName
+            self.files = files
         }
 
         /// Gemma 4 E2B — multimodal (image + audio + video + text), 3.1 GB,
@@ -387,6 +412,9 @@ public final class ModelDownloader: NSObject {
         var downloadURL: String?
         var folderName: String?
         var modelName: String?
+        // An explicit-list model's files: without them a restored download
+        // couldn't tell it's complete (`localModelURL` keys off the list).
+        var explicitFiles: [ModelInfo.File]?
     }
 
     // MARK: - Range segments + joins
@@ -548,6 +576,14 @@ public final class ModelDownloader: NSObject {
 
     public func localModelURL(for model: ModelInfo) -> URL? {
         let dir = modelsDirectory.appendingPathComponent(model.folderName)
+        if let files = model.files {
+            let complete = files.allSatisfy { file in
+                let attrs = try? fileManager.attributesOfItem(
+                    atPath: dir.appendingPathComponent(file.localPath).path)
+                return (attrs?[.size] as? NSNumber)?.int64Value == file.size
+            }
+            return complete ? dir : nil
+        }
         // Qwen3.5 has its own mlpackage names (no `model.mlpackage`).
         // Check shipping variants in order. Any one of these marks the
         // folder as a Qwen3.5 model folder.
@@ -764,6 +800,10 @@ public final class ModelDownloader: NSObject {
                     if self.isDownloading && self.currentModel?.id == model.id {
                         self.downloadContinuation?.resume(throwing: CancellationError())
                         self.downloadContinuation = continuation
+                        // The caller's info is authoritative: a download
+                        // restored from disk rebuilt its own from the
+                        // persisted state.
+                        self.currentModel = model
                         if self.progressLogStart == nil { self.progressLogStart = Date() }
                         if self.isPaused {
                             self.resumeDownload()
@@ -796,7 +836,7 @@ public final class ModelDownloader: NSObject {
                     self.destDir = dest
                     try? self.fileManager.createDirectory(at: dest, withIntermediateDirectories: true)
 
-                    if model.downloadURL.contains("huggingface.co") {
+                    if model.files != nil || model.downloadURL.contains("huggingface.co") {
                         self.buildHuggingFaceFileList(model)
                         self.fillDownloadSlots()
                     } else {
@@ -1545,7 +1585,8 @@ public final class ModelDownloader: NSObject {
             files: pendingFiles,
             downloadURL: model.downloadURL,
             folderName: model.folderName,
-            modelName: model.name
+            modelName: model.name,
+            explicitFiles: model.files
         )
         try? JSONEncoder().encode(state).write(to: stateURL)
     }
@@ -1560,7 +1601,8 @@ public final class ModelDownloader: NSObject {
         let model: ModelInfo
         if let url = state.downloadURL, let folder = state.folderName {
             model = ModelInfo(id: state.modelId, name: state.modelName ?? state.modelId,
-                              size: "", downloadURL: url, folderName: folder)
+                              size: "", downloadURL: url, folderName: folder,
+                              files: state.explicitFiles)
         } else if let known = availableModels.first(where: { $0.id == state.modelId }) {
             model = known
         } else {
@@ -1600,6 +1642,10 @@ public final class ModelDownloader: NSObject {
     // MARK: - HuggingFace File List
 
     private func buildHuggingFaceFileList(_ model: ModelInfo) {
+        if let files = model.files {
+            buildExplicitFileList(files)
+            return
+        }
         // E4B lives in its own repo with a flat layout (chunks at the root,
         // text-only — no prefill, vision, or audio). E2B lives under swa/ +
         // prefill/ + vision/audio at root.
@@ -1790,6 +1836,22 @@ public final class ModelDownloader: NSObject {
         completedBytes = 0
         countedBytes = [:]
         nextFileIndex = 0
+    }
+
+    /// An app-supplied flat list (`ModelInfo.files`): biggest first, large
+    /// files as Range segments, like the shipping Gemma layout.
+    private func buildExplicitFileList(_ files: [ModelInfo.File]) {
+        pendingFiles = Self.explicitDownloadFiles(files)
+        totalBytesForAllFiles = pendingFiles.reduce(0) { $0 + $1.estimatedSize }
+        completedBytes = 0
+        countedBytes = [:]
+        nextFileIndex = 0
+    }
+
+    static func explicitDownloadFiles(_ files: [ModelInfo.File]) -> [DownloadFile] {
+        rangeSegmented(files
+            .sorted { $0.size > $1.size }
+            .map { DownloadFile(remotePath: $0.remotePath, localPath: $0.localPath, estimatedSize: $0.size) })
     }
 
     /// Gemma 4 E4B layout on `mlboydaisuke/gemma-4-E4B-coreml`. Text-only

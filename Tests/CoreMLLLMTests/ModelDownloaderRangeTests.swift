@@ -8,6 +8,23 @@ final class ModelDownloaderRangeTests: XCTestCase {
     private typealias File = ModelDownloader.DownloadFile
     private let seg = ModelDownloader.rangeSegmentSize
 
+    // MARK: - explicit file lists
+
+    /// Biggest first; the big file is segmented and joins back to its own
+    /// path; an absolute remote URL passes through untouched.
+    func testExplicitListOrdersAndSegments() {
+        let files = [
+            ModelDownloader.ModelInfo.File(remotePath: "small.bin", localPath: "small.bin", size: 1_000),
+            .init(remotePath: "https://example.com/big.bin", localPath: "big.bin", size: 3 * seg + 5),
+        ]
+        let planned = ModelDownloader.explicitDownloadFiles(files)
+        XCTAssertEqual(planned.count, 4)
+        XCTAssertEqual(planned.prefix(3).map(\.joinTarget), ["big.bin", "big.bin", "big.bin"])
+        XCTAssertTrue(planned.prefix(3).allSatisfy { $0.remotePath == "https://example.com/big.bin" })
+        XCTAssertEqual(planned.prefix(3).reduce(0) { $0 + $1.estimatedSize }, 3 * seg + 5)
+        XCTAssertEqual(planned.last, File(remotePath: "small.bin", localPath: "small.bin", estimatedSize: 1_000))
+    }
+
     // MARK: - rangeSegmented
 
     func testSmallFilesStayWhole() {
