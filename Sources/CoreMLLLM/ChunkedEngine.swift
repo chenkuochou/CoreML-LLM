@@ -209,6 +209,66 @@ final class ChunkedEngine {
         prefillLock.unlock()
     }
 
+    // MARK: On-demand prefill (`CoreMLLLM.prefillOnDemand`)
+
+    /// Where the prefill chunks were loaded from, so they can be reloaded
+    /// after `detachPrefill()`. Nil when the bundle has no prefill chunks.
+    private var prefillSource: (directory: URL, config: MLModelConfiguration)?
+    private var _prefillDetached = false
+
+    /// True only when prefill was released on purpose (not still loading).
+    var isPrefillDetached: Bool {
+        prefillLock.lock(); defer { prefillLock.unlock() }
+        return _prefillDetached
+    }
+
+    /// Release the four prefill models. Their ANE-resident weights go with
+    /// them, so only the decode set stays resident between prefills.
+    func detachPrefill() {
+        guard prefillSource != nil else { return }
+        prefillLock.lock()
+        let had = _prefillChunk1 != nil
+        _prefillChunk1 = nil; _prefillChunk2 = nil
+        _prefillChunk3 = nil; _prefillChunk4 = nil
+        if had { _prefillDetached = true }
+        prefillLock.unlock()
+    }
+
+    fileprivate func markPrefillDetached() {
+        guard prefillSource != nil else { return }
+        prefillLock.lock(); _prefillDetached = true; prefillLock.unlock()
+    }
+
+    /// Reload the prefill models released by `detachPrefill()` (warm ANE
+    /// cache: ~0.1-0.2 s for all four, loaded concurrently).
+    private let prefillReloadLock = NSLock()
+
+    func reloadDetachedPrefill() throws {
+        prefillReloadLock.lock(); defer { prefillReloadLock.unlock() }
+        guard isPrefillDetached, let source = prefillSource else { return }
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let names = ["prefill_chunk1", "prefill_chunk2", "prefill_chunk3", "prefill_chunk4"]
+        var models = [MLModel?](repeating: nil, count: 4)
+        var firstError: Error?
+        let lock = NSLock()
+        DispatchQueue.concurrentPerform(iterations: 4) { i in
+            let url = source.directory.appendingPathComponent("\(names[i]).mlmodelc")
+            do {
+                let m = try MLModel(contentsOf: url, configuration: source.config)
+                lock.lock(); models[i] = m; lock.unlock()
+            } catch {
+                lock.lock(); if firstError == nil { firstError = error }; lock.unlock()
+            }
+        }
+        if let firstError { throw firstError }
+        guard let p1 = models[0], let p2 = models[1], let p3 = models[2], let p4 = models[3] else {
+            throw CoreMLLLMError.prefillNotAvailable
+        }
+        attachPrefill(p1, p2, p3, p4)
+        prefillLock.lock(); _prefillDetached = false; prefillLock.unlock()
+        print("[Load] prefill reloaded on demand in \(String(format: "%.2f", CFAbsoluteTimeGetCurrent() - t0))s")
+    }
+
     /// Warm the prefill path only. Called by the deferred-load task after
     /// attachPrefill so the first real prefill doesn't pay the cold-compile
     /// hit even when prefill arrived after finalPrewarm.
@@ -231,6 +291,19 @@ final class ChunkedEngine {
         reset()
         let dt = CFAbsoluteTimeGetCurrent() - t0
         print("[Load] Prefill-only warm done in \(String(format: "%.2f", dt))s")
+    }
+
+    /// `warmPrefillOnly` without the `currentPosition == 0` guard, for the
+    /// on-demand preload. Safe only while no generation runs: every turn
+    /// starts with `reset()`, so the KV it overwrites is dead state.
+    /// `CoreMLLLM.preparePrefill` enforces that.
+    func warmPrefillIdle() {
+        guard hasPrefill else { return }
+        let t0 = CFAbsoluteTimeGetCurrent()
+        _ = try? runPrefill(tokenIDs: [0])
+        for i in 1...2 { _ = try? predictStep(tokenID: 0, position: i) }
+        reset()
+        print("[Load] prefill preload warm done in \(String(format: "%.2f", CFAbsoluteTimeGetCurrent() - t0))s")
     }
 
     var hasVerify: Bool {
@@ -856,6 +929,9 @@ final class ChunkedEngine {
             kFull2:    ioSurfaceArray(slots: c2KF.slots, nkv: c2KF.nkv, seqLen: ctx),
             vFull2:    ioSurfaceArray(slots: c2KF.slots, nkv: c2KF.nkv, seqLen: ctx),
             config: config, prefillN: prefillN)
+        if hasPrefillFiles, findModel("prefill_chunk1")?.pathExtension == "mlmodelc" {
+            engine.prefillSource = (directory, prefillConfig)
+        }
 
         // ANE pipeline prewarm (Phase 0b): dummy decode steps at load time
         // force the ANE compiler to finalize dispatch schedules and resident
@@ -914,6 +990,18 @@ final class ChunkedEngine {
                     let k = await counter.bump()
                     progressCopy?("Prefill chunks \(k)/4 ready")
                     return m
+                }
+                if CoreMLLLM.prefillOnDemand {
+                    // Compile-cache only: one chunk resident at a time, then
+                    // mark detached — the first turn's preload loads all four.
+                    for name in ["prefill_chunk1", "prefill_chunk2", "prefill_chunk3", "prefill_chunk4"] {
+                        _ = try await bgLoad(name)
+                    }
+                    guard let engine else { return }
+                    engine.markPrefillDetached()
+                    print("[Load/bg] prefill chunks compiled in \(String(format: "%.1f", CFAbsoluteTimeGetCurrent() - bgT0))s — on demand, not resident")
+                    progressCopy?("Ready")
+                    return
                 }
                 // Load the four prefill chunks concurrently so the
                 // window is bound by the slowest chunk, not their sum.

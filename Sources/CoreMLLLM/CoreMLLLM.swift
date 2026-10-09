@@ -29,6 +29,61 @@ import Tokenizers
 /// }
 /// ```
 public final class CoreMLLLM: @unchecked Sendable {
+    /// Keep the prefill chunks loaded only around each batched prefill:
+    /// reload before it, release after. On iOS 27.0.1 ANE-resident weights
+    /// count toward the app's `phys_footprint` (the "neural" ledger), and the
+    /// decode + prefill sets together are ~2.6 GB for Gemma 4 E2B, enough to
+    /// hit the per-app memory limit. Costs a warm reload (~0.1-0.2 s) per
+    /// prefill. Set before `load`.
+    nonisolated(unsafe) public static var prefillOnDemand = false
+
+    // MARK: Prefill preload (`prefillOnDemand`)
+
+    private let useLock = NSLock()
+    private var generationsInFlight = 0
+    private var prepareTask: Task<Void, Never>?
+
+    private func beginGeneration() {
+        useLock.lock(); generationsInFlight += 1; useLock.unlock()
+    }
+    private func endGeneration() {
+        useLock.lock(); generationsInFlight -= 1; useLock.unlock()
+    }
+
+    /// Load (and warm) the prefill chunks ahead of a turn — call when the user
+    /// starts giving input (speech detected, typing, mic press), so the reload
+    /// and the cold first prefill overlap the input instead of delaying the
+    /// reply. No-op unless `prefillOnDemand`, while a generation runs (a turn
+    /// reloads for itself), or when already loaded. The next `stream` waits
+    /// for it, so the two never touch the engine at once.
+    public func preparePrefill() {
+        guard CoreMLLLM.prefillOnDemand, let engine = chunkedEngine else { return }
+        useLock.lock(); defer { useLock.unlock() }
+        guard generationsInFlight == 0, prepareTask == nil, engine.isPrefillDetached else { return }
+        prepareTask = Task.detached(priority: .userInitiated) { [weak self] in
+            do { try engine.reloadDetachedPrefill() } catch {
+                print("[Load] prefill preload failed: \(error)")
+            }
+            engine.warmPrefillIdle()
+            guard let self else { return }
+            self.useLock.lock(); self.prepareTask = nil; self.useLock.unlock()
+        }
+    }
+
+    /// Drop a preload whose input never became a turn (e.g. noise ended
+    /// Hands-free listening). No-op while a preload or generation runs.
+    public func releasePreparedPrefill() {
+        guard CoreMLLLM.prefillOnDemand, let engine = chunkedEngine else { return }
+        useLock.lock(); defer { useLock.unlock() }
+        guard generationsInFlight == 0, prepareTask == nil else { return }
+        engine.detachPrefill()
+    }
+
+    private func awaitPreparedPrefill() async {
+        useLock.lock(); let task = prepareTask; useLock.unlock()
+        await task?.value
+    }
+
     private let tokenizer: any Tokenizer
     private var config: ModelConfig
 
@@ -809,7 +864,7 @@ public final class CoreMLLLM: @unchecked Sendable {
         let hasAudioInput = audioFeatures != nil
         let chatPrompt = buildPrompt(messages, hasImage: hasImage, hasAudio: hasAudioInput,
                                      audioTokenCount: actualAudioTokens)
-        return try streamFromPrompt(
+        return try await streamFromPrompt(
             chatPrompt,
             imageFeatures: imageFeatures,
             imageNumTokens: imageFeatures != nil ? 256 : 0,
@@ -861,7 +916,7 @@ public final class CoreMLLLM: @unchecked Sendable {
         let chatPrompt = buildGemmaMediaPrompt(messages, mediaBlock: videoBlock,
                                                 audioBlock: audioBlock)
 
-        return try streamFromPrompt(
+        return try await streamFromPrompt(
             chatPrompt,
             imageFeatures: combined,
             imageNumTokens: frames.count * tokensPerFrame,
@@ -910,9 +965,11 @@ public final class CoreMLLLM: @unchecked Sendable {
         audioFeatures: MLMultiArray?,
         audioTokenCount: Int,
         maxTokens: Int
-    ) throws -> AsyncStream<String> {
+    ) async throws -> AsyncStream<String> {
         let tokenIDs = tokenizer.encode(text: chatPrompt)
 
+        await awaitPreparedPrefill()
+        beginGeneration()
         reset()
 
         // Clear recording buffers and record the prompt IDs for this turn.
@@ -953,6 +1010,7 @@ public final class CoreMLLLM: @unchecked Sendable {
             // a user-initiated cancel (or stream deinit) stops generation
             // promptly instead of running to maxDecode.
             let genTask = Task(priority: decodePriority) {
+                defer { mutableSelf.endGeneration() }
                 do {
                     let IMAGE_TOKEN_ID = 258880
                     let AUDIO_TOKEN_ID = 258881
@@ -1001,6 +1059,7 @@ public final class CoreMLLLM: @unchecked Sendable {
                         // For short prompts (< 64 tok) the decode loop is
                         // already comparable to batched prefill and we
                         // never waited.
+                        if CoreMLLLM.prefillOnDemand { try engine.reloadDetachedPrefill() }
                         let prefillReady = engine.hasPrefill
                         if !prefillReady, tokens.count >= 64 {
                             print("[Load] prefill chunks not ready — using decode-loop prefill for \(tokens.count) tok (avoids multi-s await)")
@@ -1019,6 +1078,7 @@ public final class CoreMLLLM: @unchecked Sendable {
                                     audioNumTokens: audTokenCount
                                 )
                             }
+                            if CoreMLLLM.prefillOnDemand { engine.detachPrefill() }
                             imageIdx = tokens[0..<prefillLen].filter {
                                 $0 == IMAGE_TOKEN_ID || $0 == VIDEO_TOKEN_ID
                             }.count
@@ -1352,6 +1412,7 @@ public final class CoreMLLLM: @unchecked Sendable {
         self.lastEmittedTokenIDs = []
 
         var nextID = 0
+        if CoreMLLLM.prefillOnDemand { try engine.reloadDetachedPrefill() }
         let prefillLen = min(tokens.count, engine.prefillN)
         let useHybrid = engine.hasPrefill && prefillLen > 0
         if useHybrid {
@@ -1359,6 +1420,7 @@ public final class CoreMLLLM: @unchecked Sendable {
                 let batch = Array(tokens[0..<prefillLen])
                 nextID = try engine.runPrefill(tokenIDs: batch)
             }
+            if CoreMLLLM.prefillOnDemand { engine.detachPrefill() }
             engine.currentPosition = prefillLen
             for step in prefillLen..<tokens.count {
                 try autoreleasepool {
